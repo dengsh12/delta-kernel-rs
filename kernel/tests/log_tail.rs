@@ -242,7 +242,7 @@ async fn incremental_snapshot_with_log_tail() -> Result<(), Box<dyn std::error::
     ];
 
     // Build incremental snapshot with log_tail
-    let new_snapshot = Snapshot::builder_from_new(initial_snapshot)
+    let new_snapshot = Snapshot::builder_from(initial_snapshot)
         .with_log_tail(log_tail)
         .build(engine.as_ref())?;
 

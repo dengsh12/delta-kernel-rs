@@ -154,10 +154,10 @@ impl TableChanges {
             .ensure_operation_supported(Operation::Cdf)?;
 
         let end_snapshot = match end_version {
-            Some(version) => Snapshot::builder_from_new(start_snapshot.clone())
+            Some(version) => Snapshot::builder_from(start_snapshot.clone())
                 .at_version(version)
                 .build(engine)?,
-            None => Snapshot::builder_from_new(start_snapshot.clone()).build(engine)?,
+            None => Snapshot::builder_from(start_snapshot.clone()).build(engine)?,
         };
         end_snapshot
             .table_configuration()
