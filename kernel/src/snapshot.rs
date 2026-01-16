@@ -89,7 +89,7 @@ impl Snapshot {
     /// - `engine`: Implementation of [`Engine`] apis.
     /// - `version`: target version of the [`Snapshot`]. None will create a snapshot at the latest
     ///   version of the table.
-    pub fn builder_from(existing_snapshot: SnapshotRef) -> SnapshotBuilder {
+    pub fn builder_from_new(existing_snapshot: SnapshotRef) -> SnapshotBuilder {
         SnapshotBuilder::new_from(existing_snapshot)
     }
 
@@ -727,7 +727,7 @@ mod tests {
             .build(&engine)
             .unwrap();
         // 1. new version < existing version: error
-        let snapshot_res = Snapshot::builder_from(old_snapshot.clone())
+        let snapshot_res = Snapshot::builder_from_new(old_snapshot.clone())
             .at_version(0)
             .build(&engine);
         assert!(matches!(
@@ -736,7 +736,7 @@ mod tests {
         ));
 
         // 2. new version == existing version
-        let snapshot = Snapshot::builder_from(old_snapshot.clone())
+        let snapshot = Snapshot::builder_from_new(old_snapshot.clone())
             .at_version(1)
             .build(&engine)
             .unwrap();
@@ -758,7 +758,7 @@ mod tests {
             let base_snapshot = Snapshot::builder_for(url.clone())
                 .at_version(0)
                 .build(&engine)?;
-            let snapshot = Snapshot::builder_from(base_snapshot.clone())
+            let snapshot = Snapshot::builder_from_new(base_snapshot.clone())
                 .at_version(1)
                 .build(&engine)?;
             let expected = Snapshot::builder_for(url.clone())
@@ -808,14 +808,14 @@ mod tests {
         let base_snapshot = Snapshot::builder_for(url.clone())
             .at_version(0)
             .build(&engine)?;
-        let snapshot = Snapshot::builder_from(base_snapshot.clone()).build(&engine)?;
+        let snapshot = Snapshot::builder_from_new(base_snapshot.clone()).build(&engine)?;
         let expected = Snapshot::builder_for(url.clone())
             .at_version(0)
             .build(&engine)?;
         assert_eq!(snapshot, expected);
         // version exceeds latest version of the table = err
         assert!(matches!(
-            Snapshot::builder_from(base_snapshot.clone()).at_version(1).build(&engine),
+            Snapshot::builder_from_new(base_snapshot.clone()).at_version(1).build(&engine),
             Err(Error::Generic(msg)) if msg == "Requested snapshot version 1 is newer than the latest version 0"
         ));
 
@@ -882,7 +882,7 @@ mod tests {
             .at_version(0)
             .build(&engine)?;
         assert!(matches!(
-            Snapshot::builder_from(base_snapshot.clone()).at_version(2).build(&engine),
+            Snapshot::builder_from_new(base_snapshot.clone()).at_version(2).build(&engine),
             Err(Error::Generic(msg)) if msg == "LogSegment end version 1 not the same as the specified end version 2"
         ));
 
@@ -992,7 +992,7 @@ mod tests {
             .build(&engine)?;
 
         // first test: no new crc
-        let snapshot = Snapshot::builder_from(base_snapshot.clone())
+        let snapshot = Snapshot::builder_from_new(base_snapshot.clone())
             .at_version(1)
             .build(&engine)?;
         let expected = Snapshot::builder_for(url.clone())
@@ -1021,7 +1021,7 @@ mod tests {
             "protocol": protocol(1, 2),
         });
         store.put(&path, crc.to_string().into()).await?;
-        let snapshot = Snapshot::builder_from(base_snapshot.clone())
+        let snapshot = Snapshot::builder_from_new(base_snapshot.clone())
             .at_version(1)
             .build(&engine)?;
         let expected = Snapshot::builder_for(url.clone())
