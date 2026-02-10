@@ -735,3 +735,66 @@ async fn test_checkpoint_preserves_domain_metadata() -> DeltaResult<()> {
 }
 
 // TODO: Add test that checkpoint does not contain tombstoned domain metadata.
+
+/// Tests that V1 checkpoints (table without v2Checkpoint feature) work correctly
+/// using `snapshot.checkpoint()`. Verifies protocol configuration and checkpoint content.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_v1_checkpoint_with_no_v2_checkpoint_feature() -> DeltaResult<()> {
+    let (store, _) = new_in_memory_store();
+    let executor = Arc::new(TokioMultiThreadExecutor::new(
+        tokio::runtime::Handle::current(),
+    ));
+    let engine = DefaultEngineBuilder::new(store.clone())
+        .with_task_executor(executor)
+        .build();
+
+    // Create a table WITHOUT v2Checkpoint feature (V1 checkpoint)
+    write_commit_to_store(
+        &store,
+        vec![
+            create_basic_protocol_action(), // No v2Checkpoint feature
+            create_metadata_action(),
+        ],
+        0,
+    )
+    .await?;
+
+    // Add a file
+    write_commit_to_store(&store, vec![create_add_action("file1.parquet")], 1).await?;
+
+    let table_root = Url::parse("memory:///")?;
+    let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
+
+    // Verify protocol: Reader Version 3, Writer Version 7
+    let protocol = snapshot.table_configuration().protocol();
+    assert_eq!(protocol.min_reader_version(), 3);
+    assert_eq!(protocol.min_writer_version(), 7);
+
+    // Verify v2Checkpoint is NOT in readerFeatures or writerFeatures
+    use crate::table_features::TableFeature;
+    let has_v2_in_reader = protocol
+        .reader_features()
+        .is_some_and(|f| f.contains(&TableFeature::V2Checkpoint));
+    let has_v2_in_writer = protocol
+        .writer_features()
+        .is_some_and(|f| f.contains(&TableFeature::V2Checkpoint));
+    assert!(
+        !has_v2_in_reader,
+        "v2Checkpoint should NOT be in readerFeatures"
+    );
+    assert!(
+        !has_v2_in_writer,
+        "v2Checkpoint should NOT be in writerFeatures"
+    );
+
+    // Write checkpoint using the simple API
+    snapshot.checkpoint(&engine)?;
+
+    // Verify checkpoint was created and _last_checkpoint has correct counts
+    // V1 checkpoint: 1 protocol + 1 metadata + 1 add = 3 actions (no CheckpointMetadata)
+    let checkpoint_path = Path::from("_delta_log/00000000000000000001.checkpoint.parquet");
+    let checkpoint_size = store.head(&checkpoint_path).await?.size;
+    assert_last_checkpoint_contents(&store, 1, 3, 1, checkpoint_size).await?;
+
+    Ok(())
+}
