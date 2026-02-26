@@ -240,6 +240,7 @@ pub(crate) fn coerce_batch_nullability(
         src_children: &ArrowFields,
         target_children: &ArrowFields,
         type_mismatch_validator: TypeMismatchValidator<'_>,
+        all_parents_non_null: bool,
     ) -> DeltaResult<Arc<dyn ArrowArray>> {
         let src_struct = src_column
             .as_any()
@@ -257,6 +258,7 @@ pub(crate) fn coerce_batch_nullability(
                         src_child,
                         target_child,
                         type_mismatch_validator,
+                        all_parents_non_null,
                     )
                 })
                 .collect::<DeltaResult<Vec<_>>>()?
@@ -275,6 +277,7 @@ pub(crate) fn coerce_batch_nullability(
         src_entries_field: &ArrowFieldRef,
         target_entries_field: &ArrowFieldRef,
         type_mismatch_validator: TypeMismatchValidator<'_>,
+        all_parents_non_null: bool,
     ) -> DeltaResult<Arc<dyn ArrowArray>> {
         let src_map = src_column
             .as_any()
@@ -288,6 +291,7 @@ pub(crate) fn coerce_batch_nullability(
             src_entries_field,
             target_entries_field,
             type_mismatch_validator,
+            all_parents_non_null,
         )?;
         let coerced_entries = coerced_entries_col
             .as_any()
@@ -311,6 +315,7 @@ pub(crate) fn coerce_batch_nullability(
         src_element: &ArrowFieldRef,
         target_element: &ArrowFieldRef,
         type_mismatch_validator: TypeMismatchValidator<'_>,
+        all_parents_non_null: bool,
     ) -> DeltaResult<Arc<dyn ArrowArray>> {
         let src_list = src_column
             .as_any()
@@ -324,6 +329,7 @@ pub(crate) fn coerce_batch_nullability(
             src_element,
             target_element,
             type_mismatch_validator,
+            all_parents_non_null,
         )?;
         Ok(Arc::new(GenericListArray::<i32>::try_new(
             coerced_element_field,
@@ -333,14 +339,32 @@ pub(crate) fn coerce_batch_nullability(
         )?))
     }
 
-    // Recursively coerces nullability for a column+field pair. For struct columns, recurses
-    // into children; for leaf columns, just adjusts the field's nullability flag.
+    /// Recursively coerces nullability for a column+field pair. For struct columns, recurses
+    /// into children; for leaf columns, just adjusts the field's nullability flag.
+    ///
+    /// `all_parents_non_null`: when true, no ancestor [`ArrowArray`] contains nulls, so any
+    /// nulls in the data are genuine (not inherited from a null parent). This enables
+    /// validation of nullable→non-nullable coercions at nested levels.
     fn coerce(
         src_column: Arc<dyn ArrowArray>,
         src_field: &ArrowFieldRef,
         target_field: &ArrowFieldRef,
         type_mismatch_validator: TypeMismatchValidator<'_>,
+        all_parents_non_null: bool,
     ) -> DeltaResult<(Arc<dyn ArrowArray>, ArrowFieldRef)> {
+        if all_parents_non_null
+            && src_field.is_nullable()
+            && !target_field.is_nullable()
+            && src_column.null_count() > 0
+        {
+            return Err(Error::internal_error(format!(
+                "field '{}' is non-nullable in the target schema \
+                 but source data contains {} null(s)",
+                src_field.name(),
+                src_column.null_count(),
+            )));
+        }
+        let current_and_parent_level_non_null = all_parents_non_null && src_column.null_count() == 0;
         let coerced_array: Arc<dyn ArrowArray> =
             match (src_column.data_type(), target_field.data_type()) {
                 (ArrowDataType::Struct(src_children), ArrowDataType::Struct(target_children))
@@ -351,6 +375,7 @@ pub(crate) fn coerce_batch_nullability(
                         src_children,
                         target_children,
                         type_mismatch_validator,
+                        current_and_parent_level_non_null,
                     )?
                 }
                 (
@@ -361,6 +386,7 @@ pub(crate) fn coerce_batch_nullability(
                     src_entries_field,
                     target_entries_field,
                     type_mismatch_validator,
+                    current_and_parent_level_non_null,
                 )?,
                 (ArrowDataType::List(src_element), ArrowDataType::List(target_element))
                     if src_element != target_element =>
@@ -370,6 +396,7 @@ pub(crate) fn coerce_batch_nullability(
                         src_element,
                         target_element,
                         type_mismatch_validator,
+                        current_and_parent_level_non_null,
                     )?
                 }
 
@@ -420,7 +447,7 @@ pub(crate) fn coerce_batch_nullability(
             .zip(src_fields.iter())
             .zip(target_schema.fields().iter())
             .map(|((src_column, src_field), target_field)| {
-                coerce(src_column, src_field, target_field, type_mismatch_validator)
+                coerce(src_column, src_field, target_field, type_mismatch_validator, true)
             })
             .collect::<DeltaResult<Vec<_>>>()?
             .into_iter()
@@ -3752,6 +3779,64 @@ mod tests {
         let result = coerce_batch_nullability(batch, &target_schema, Some(&allow_all)).unwrap();
         assert_eq!(result.schema().field(0).data_type(), &ArrowDataType::Int32);
         assert!(result.schema().field(0).is_nullable());
+    }
+
+    /// Helper: builds a batch with schema `parent_struct: Struct(parent_nullable) { val: Int32(nullable) }`
+    fn coerce_nullable_child_under_parent(parent_nullable: bool) -> DeltaResult<RecordBatch> {
+        let inner_col: Arc<dyn ArrowArray> = Arc::new(Int32Array::from(vec![Some(1), None]));
+        let src_inner = ArrowField::new("val", ArrowDataType::Int32, true);
+        let tgt_inner = ArrowField::new("val", ArrowDataType::Int32, false);
+        let parent_nulls = if parent_nullable {
+            Some(vec![true, false].into())
+        } else {
+            None
+        };
+        let struct_col: Arc<dyn ArrowArray> = Arc::new(
+            StructArray::try_new(
+                ArrowFields::from(vec![src_inner.clone()]),
+                vec![inner_col],
+                parent_nulls,
+            )
+            .unwrap(),
+        );
+        let src_field = ArrowField::new(
+            "parent_struct",
+            ArrowDataType::Struct(ArrowFields::from(vec![src_inner])),
+            parent_nullable,
+        );
+        let tgt_field = ArrowField::new(
+            "parent_struct",
+            ArrowDataType::Struct(ArrowFields::from(vec![tgt_inner])),
+            parent_nullable,
+        );
+        let src_schema = Arc::new(ArrowSchema::new(vec![src_field]));
+        let target_schema = Arc::new(ArrowSchema::new(vec![tgt_field]));
+        let batch = RecordBatch::try_new(src_schema, vec![struct_col]).unwrap();
+        coerce_batch_nullability(batch, &target_schema, None)
+    }
+
+    /// Non-null parent → child nulls are genuine → coercion to non-nullable must fail.
+    #[test]
+    fn test_coerce_batch_nullability_rejects_nulls_under_non_nullable_parent() {
+        let result = coerce_nullable_child_under_parent(false);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("field 'val' is non-nullable") && err.contains("1 null(s)"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Null parent → child nulls may be inherited → coercion must succeed.
+    #[test]
+    fn test_coerce_batch_nullability_allows_nulls_under_nullable_parent() {
+        let result = coerce_nullable_child_under_parent(true).unwrap();
+        let schema = result.schema();
+        let child = match schema.field(0).data_type() {
+            ArrowDataType::Struct(f) => &f[0],
+            other => panic!("expected Struct, got {other:?}"),
+        };
+        assert!(!child.is_nullable());
     }
 
     /// Verifies metadata is preserved at every nesting level (struct, list, map) after coercion.
