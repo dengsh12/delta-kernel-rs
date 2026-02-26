@@ -171,22 +171,13 @@ pub(crate) fn fixup_parquet_read<T>(
     requested_ordering: &[ReorderIndex],
     row_indexes: Option<&mut FlattenedRangeIterator<i64>>,
     file_location: Option<&str>,
-    target_schema: Option<&ArrowSchemaRef>,
+    _target_schema: Option<&ArrowSchemaRef>,
 ) -> DeltaResult<T>
 where
     StructArray: Into<T>,
 {
     let data = reorder_struct_array(batch.into(), requested_ordering, row_indexes, file_location)?;
     let data = fix_nested_null_masks(data);
-    let data = if let Some(schema) = target_schema {
-        let batch = RecordBatch::from(data);
-        // Type mismatches are already handled by `reorder_struct_array` above,
-        // we don't do anything more strict here.
-        let allow_all = |_: &ArrowFieldRef, _: &ArrowFieldRef| Ok(());
-        coerce_batch_nullability(batch, schema, Some(&allow_all))?.into()
-    } else {
-        data
-    };
     Ok(data.into())
 }
 
@@ -3837,6 +3828,27 @@ mod tests {
             other => panic!("expected Struct, got {other:?}"),
         };
         assert!(!child.is_nullable());
+    }
+
+    /// On this branch, `fixup_parquet_read` ignores `_target_schema`, so a nullable column
+    /// with nulls passes through even when the target schema declares it non-nullable.
+    #[test]
+    fn test_fixup_parquet_read_allows_genuine_null_violation() {
+        let col: Arc<dyn ArrowArray> = Arc::new(Int32Array::from(vec![Some(1), None]));
+        let src_field = ArrowField::new("val", ArrowDataType::Int32, true);
+        let tgt_field = ArrowField::new("val", ArrowDataType::Int32, false);
+        let src_schema = Arc::new(ArrowSchema::new(vec![src_field]));
+        let target_schema = Arc::new(ArrowSchema::new(vec![tgt_field]));
+        let batch = RecordBatch::try_new(src_schema, vec![col]).unwrap();
+
+        let ordering = vec![ReorderIndex::identity(0)];
+        let result: DeltaResult<StructArray> =
+            fixup_parquet_read(batch, &ordering, None, None, Some(&target_schema));
+        assert!(result.is_ok());
+        let struct_arr = result.unwrap();
+        // Target says non-nullable, but data still has the nullable field with nulls.
+        assert!(struct_arr.fields()[0].is_nullable());
+        assert_eq!(struct_arr.column(0).null_count(), 1);
     }
 
     /// Verifies metadata is preserved at every nesting level (struct, list, map) after coercion.

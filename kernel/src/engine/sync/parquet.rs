@@ -231,6 +231,79 @@ mod tests {
         assert!(result.next().is_none());
     }
 
+    /// E2E: write a parquet file where a non-nullable parent struct contains a nullable child
+    /// with nulls. Read it back with a schema declaring the child as non-nullable. The read
+    /// should succeed because `fixup_parquet_read` does not enforce target schema nullability.
+    #[test]
+    fn test_read_parquet_allows_genuine_null_in_non_nullable_parent() {
+        use crate::arrow::array::{Int32Array, StructArray};
+        use crate::arrow::datatypes::Fields as ArrowFields;
+        use crate::schema::{DataType as KernelDataType, StructField, StructType};
+
+        let handler = SyncParquetHandler;
+        let temp_dir = tempdir().unwrap();
+        let file_path = temp_dir.path().join("nulls.parquet");
+        let url = Url::from_file_path(&file_path).unwrap();
+
+        // Parquet schema: parent_struct: Struct(non-nullable) { val: Int32(nullable) }
+        // Child "val" has a null — this is a genuine null since parent is non-nullable.
+        let child_field = Field::new("val", ArrowDataType::Int32, true);
+        let parent_field = Field::new(
+            "parent_struct",
+            ArrowDataType::Struct(ArrowFields::from(vec![child_field.clone()])),
+            false,
+        );
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![parent_field]));
+        let child_col: Arc<dyn Array> = Arc::new(Int32Array::from(vec![Some(1), None, Some(3)]));
+        let struct_col: Arc<dyn Array> = Arc::new(
+            StructArray::try_new(
+                ArrowFields::from(vec![child_field]),
+                vec![child_col],
+                None,
+            )
+            .unwrap(),
+        );
+        let batch = RecordBatch::try_new(arrow_schema.clone(), vec![struct_col]).unwrap();
+        let file = File::create(&file_path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, arrow_schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        // Read schema: parent_struct: Struct(non-nullable) { val: Int32(non-nullable) }
+        let read_schema = Arc::new(
+            StructType::try_new(vec![StructField::new(
+                "parent_struct",
+                KernelDataType::try_struct_type(vec![StructField::new(
+                    "val",
+                    KernelDataType::INTEGER,
+                    false,
+                )])
+                .unwrap(),
+                false,
+            )])
+            .unwrap(),
+        );
+        let file_size = std::fs::metadata(&file_path).unwrap().len();
+        let file_meta = FileMeta {
+            location: url,
+            last_modified: 0,
+            size: file_size,
+        };
+        let mut result = handler
+            .read_parquet_files(&[file_meta], read_schema, None)
+            .unwrap();
+
+        // Read succeeds despite genuine nulls in a non-nullable child under non-nullable parent.
+        let engine_data = result.next().unwrap().unwrap();
+        let batch = ArrowEngineData::try_from_engine_data(engine_data).unwrap();
+        let record_batch = batch.record_batch();
+        assert_eq!(record_batch.num_rows(), 3);
+        let parent_col = record_batch.column(0);
+        assert_eq!(parent_col.null_count(), 0);
+        let struct_arr = parent_col.as_any().downcast_ref::<StructArray>().unwrap();
+        assert_eq!(struct_arr.column(0).null_count(), 1);
+    }
+
     #[test]
     fn test_sync_read_parquet_footer() -> DeltaResult<()> {
         let handler = SyncParquetHandler;
