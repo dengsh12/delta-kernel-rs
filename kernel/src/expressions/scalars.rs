@@ -837,15 +837,15 @@ impl PrimitiveType {
     }
 
     fn parse_decimal(raw: &str, dtype: DecimalType) -> Result<Scalar, Error> {
+        let parse_error = || PrimitiveType::from(dtype).parse_error(raw);
         let (base, exp): (&str, i128) = match raw.find(['e', 'E']) {
             None => (raw, 0), // no 'e' or 'E', so there's no exponent
             Some(pos) => {
                 let (base, exp) = raw.split_at(pos);
                 // exp now has '[e/E][exponent]', strip the 'e/E' and parse it
-                (base, exp[1..].parse()?)
+                (base, exp[1..].parse().map_err(|_| parse_error())?)
             }
         };
-        let parse_error = || PrimitiveType::from(dtype).parse_error(raw);
         require!(!base.is_empty(), parse_error());
 
         // now split on any '.' and parse
@@ -870,10 +870,14 @@ impl PrimitiveType {
         let scale: u8 = scale.try_into().map_err(|_| parse_error())?;
         require!(scale == dtype.scale(), parse_error());
         let int: i128 = match frac_part {
-            None => int_part.parse()?,
-            Some(frac_part) => format!("{int_part}{frac_part}").parse()?,
+            None => int_part.parse().map_err(|_| parse_error())?,
+            Some(frac_part) => format!("{int_part}{frac_part}")
+                .parse()
+                .map_err(|_| parse_error())?,
         };
-        Ok(Scalar::Decimal(DecimalData::try_new(int, dtype)?))
+        Ok(Scalar::Decimal(
+            DecimalData::try_new(int, dtype).map_err(|_| parse_error())?,
+        ))
     }
 }
 
@@ -921,9 +925,12 @@ mod tests {
     #[test]
     fn test_bad_decimal() {
         let dtype = DecimalType::try_new(3, 0).unwrap();
-        DecimalData::try_new(123456789, dtype).expect_err("should have failed");
-        PrimitiveType::parse_decimal("0.12345", dtype).expect_err("should have failed");
-        PrimitiveType::parse_decimal("12345", dtype).expect_err("should have failed");
+        assert!(matches!(
+            DecimalData::try_new(123456789, dtype),
+            Err(Error::InvalidDecimal(_))
+        ));
+        assert_decimal_parse_error("0.12345", 3, 0);
+        assert_decimal_parse_error("12345", 3, 0);
     }
     #[test]
     fn test_decimal_display() {
@@ -1036,37 +1043,40 @@ mod tests {
         Ok(())
     }
 
-    fn expect_fail_parse(raw: &str, prec: u8, scale: u8) {
+    fn assert_decimal_parse_error(raw: &str, prec: u8, scale: u8) {
         let s = PrimitiveType::decimal(prec, scale).unwrap();
-        let res = s.parse_scalar(raw);
-        assert!(res.is_err(), "Fail on {raw}");
+        assert!(matches!(
+            s.parse_scalar(raw),
+            Err(Error::ParseError(value, data_type))
+                if value == raw && data_type == s.data_type()
+        ));
     }
 
     #[test]
     fn test_parse_decimal_expect_fail() {
-        expect_fail_parse("1.000", 3, 3);
-        expect_fail_parse("iowjef", 1, 0);
-        expect_fail_parse("123Ef", 1, 0);
-        expect_fail_parse("1d2E3", 1, 0);
-        expect_fail_parse("a", 1, 0);
-        expect_fail_parse("2.a", 1, 1);
-        expect_fail_parse("E45", 1, 0);
-        expect_fail_parse("1.2.3", 1, 0);
-        expect_fail_parse("1.2E1.3", 1, 0);
-        expect_fail_parse("123.45", 5, 1);
-        expect_fail_parse(".45", 5, 1);
-        expect_fail_parse("+", 1, 0);
-        expect_fail_parse("-", 1, 0);
-        expect_fail_parse("0.-0", 2, 1);
-        expect_fail_parse("--1.0", 1, 1);
-        expect_fail_parse("+-1.0", 1, 1);
-        expect_fail_parse("-+1.0", 1, 1);
-        expect_fail_parse("++1.0", 1, 1);
-        expect_fail_parse("1.0E1+", 1, 1);
+        assert_decimal_parse_error("1.000", 3, 3);
+        assert_decimal_parse_error("iowjef", 1, 0);
+        assert_decimal_parse_error("123Ef", 1, 0);
+        assert_decimal_parse_error("1d2E3", 1, 0);
+        assert_decimal_parse_error("a", 1, 0);
+        assert_decimal_parse_error("2.a", 1, 1);
+        assert_decimal_parse_error("E45", 1, 0);
+        assert_decimal_parse_error("1.2.3", 1, 0);
+        assert_decimal_parse_error("1.2E1.3", 1, 0);
+        assert_decimal_parse_error("123.45", 5, 1);
+        assert_decimal_parse_error(".45", 5, 1);
+        assert_decimal_parse_error("+", 1, 0);
+        assert_decimal_parse_error("-", 1, 0);
+        assert_decimal_parse_error("0.-0", 2, 1);
+        assert_decimal_parse_error("--1.0", 1, 1);
+        assert_decimal_parse_error("+-1.0", 1, 1);
+        assert_decimal_parse_error("-+1.0", 1, 1);
+        assert_decimal_parse_error("++1.0", 1, 1);
+        assert_decimal_parse_error("1.0E1+", 1, 1);
         // overflow i8 for `scale`
-        expect_fail_parse("0.999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999", 1, 0);
+        assert_decimal_parse_error("0.999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999", 1, 0);
         // scale will be too small to fit in i8
-        expect_fail_parse("0.E170141183460469231731687303715884105727", 1, 0);
+        assert_decimal_parse_error("0.E170141183460469231731687303715884105727", 1, 0);
     }
 
     #[test]
