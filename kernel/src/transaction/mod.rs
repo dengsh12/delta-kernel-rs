@@ -607,21 +607,9 @@ impl<S> Transaction<S> {
             )
         );
         require!(
-            !table_config.is_catalog_managed(),
-            Error::unsupported(
-                "row-tracking preservation acknowledgement on catalog-managed tables"
-            )
-        );
-        require!(
             !table_config.is_feature_enabled(&TableFeature::IcebergCompatV3),
             Error::unsupported(
                 "row-tracking preservation acknowledgement on icebergCompatV3 tables"
-            )
-        );
-        require!(
-            self.dv_matched_files.is_empty(),
-            Error::unsupported(
-                "deletion-vector updates with row-tracking preservation acknowledgement"
             )
         );
         Ok(())
@@ -1002,9 +990,8 @@ impl Transaction<ExistingTable> {
     /// Transactions that remove files from a row-tracking table must call this regardless of their
     /// `dataChange` value.
     ///
-    /// Commit requires enabled, unsuspended row tracking. Deletion-vector updates, catalog-managed
-    /// tables, and `icebergCompatV3` are unsupported. Kernel records the acknowledgement without
-    /// reading the output Parquet files.
+    /// Commit requires enabled, unsuspended row tracking and rejects `icebergCompatV3` tables.
+    /// Kernel records the acknowledgement without reading the output Parquet files.
     ///
     /// This acknowledgement is unavailable for create-table transactions:
     ///

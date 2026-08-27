@@ -1,7 +1,7 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::sync::Arc;
 
-use delta_kernel::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
 use delta_kernel::arrow::array::{Array, ArrayRef, AsArray, Int32Array, Int64Array, StringArray};
 use delta_kernel::arrow::datatypes::{Int32Type, Int64Type};
 use delta_kernel::arrow::record_batch::RecordBatch;
@@ -21,7 +21,8 @@ use test_utils::{
 };
 use url::Url;
 
-use crate::common::write_utils::set_table_properties;
+use crate::common::read_utils::read_parquet_file;
+use crate::common::write_utils::{get_scan_files, set_table_properties};
 
 fn read_stable_values(
     snapshot: Arc<Snapshot>,
@@ -490,7 +491,6 @@ enum RewriteConfig {
     Suspended,
     CatalogManaged,
     IcebergV3,
-    DvUpdate,
 }
 
 impl RewriteConfig {
@@ -503,10 +503,6 @@ impl RewriteConfig {
                 ("io.unitycatalog.tableId", "row-tracking-rewrite-test"),
             ],
             Self::IcebergV3 => &[("delta.enableIcebergCompatV3", "true")],
-            Self::DvUpdate => &[
-                ("delta.enableRowTracking", "true"),
-                ("delta.enableDeletionVectors", "true"),
-            ],
             _ => &[("delta.enableRowTracking", "true")],
         }
     }
@@ -520,18 +516,13 @@ impl RewriteConfig {
     }
 }
 
-fn collect_scan_path(paths: &mut Vec<String>, scan_file: delta_kernel::scan::state::ScanFile) {
-    paths.push(scan_file.path);
-}
-
 #[rstest::rstest]
 #[case::data_change_false(RewriteConfig::NoDataChange, None)]
 #[case::data_change_true(RewriteConfig::DataChange, None)]
 #[case::disabled(RewriteConfig::Disabled, Some("enabled and not suspended"))]
 #[case::suspended(RewriteConfig::Suspended, Some("enabled and not suspended"))]
-#[case::catalog_managed(RewriteConfig::CatalogManaged, Some("catalog-managed"))]
+#[case::catalog_managed(RewriteConfig::CatalogManaged, None)]
 #[case::iceberg_v3(RewriteConfig::IcebergV3, Some("icebergCompatV3"))]
-#[case::dv_update(RewriteConfig::DvUpdate, Some("deletion-vector updates"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_row_tracking_preservation_acknowledgement(
     #[case] config: RewriteConfig,
@@ -582,7 +573,6 @@ async fn test_row_tracking_preservation_acknowledgement(
         .scan_metadata(engine.as_ref())?
         .next()
         .expect("source file scan metadata")?;
-    let source_paths = scan_metadata.visit_scan_files(Vec::new(), collect_scan_path)?;
     let scan_files = scan_metadata.scan_files;
     let data_change = config == RewriteConfig::DataChange;
     let mut txn = snapshot
@@ -590,7 +580,7 @@ async fn test_row_tracking_preservation_acknowledgement(
         .with_data_change(data_change);
     let add_metadata = if matches!(
         config,
-        RewriteConfig::NoDataChange | RewriteConfig::DataChange
+        RewriteConfig::NoDataChange | RewriteConfig::DataChange | RewriteConfig::CatalogManaged
     ) {
         let write_context = txn
             .write_state()?
@@ -632,21 +622,7 @@ async fn test_row_tracking_preservation_acknowledgement(
             .await?
     };
     txn.add_files(add_metadata);
-    if config == RewriteConfig::DvUpdate {
-        let descriptor = DeletionVectorDescriptor::try_new(
-            DeletionVectorStorageType::Inline,
-            "abc",
-            None,
-            3,
-            1,
-        )?;
-        txn.update_deletion_vectors(
-            HashMap::from([(source_paths[0].clone(), descriptor)]),
-            std::iter::once(Ok(scan_files)),
-        )?;
-    } else {
-        txn.remove_files(scan_files);
-    }
+    txn.remove_files(scan_files);
     txn.ack_row_tracking_preservation();
 
     if let Some(expected_error) = expected_error {
@@ -700,4 +676,336 @@ async fn test_row_tracking_preservation_acknowledgement(
         "true"
     );
     Ok(())
+}
+
+#[rstest::rstest]
+#[case::update(RewriteOperation::Update)]
+#[case::merge(RewriteOperation::Merge)]
+#[case::optimize(RewriteOperation::Optimize)]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_rewrite_operation_preserves_stable_row_tracking_values(
+    #[case] operation: RewriteOperation,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
+    let table_url = Url::from_directory_path(&table_path).expect("table path is a directory");
+    let created = kernel_create_table(
+        table_path.as_str(),
+        schema_ref! { nullable "number": INTEGER },
+        "Test/1.0",
+    )
+    .with_table_properties([("delta.enableRowTracking", "true")])
+    .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+    .commit(engine.as_ref())?
+    .unwrap_post_commit_snapshot();
+    let mut source_snapshot = created;
+    for number in [1, 2, 3] {
+        source_snapshot = test_utils::insert_data(
+            source_snapshot,
+            &engine,
+            vec![Arc::new(Int32Array::from(vec![number]))],
+        )
+        .await?
+        .unwrap_post_commit_snapshot();
+    }
+    let scanned_rows = read_rows_for_rewrite(source_snapshot.clone(), engine.clone())?;
+    let replacement_rows = operation.apply(&scanned_rows);
+    let scan_files = get_scan_files(source_snapshot.clone(), engine.as_ref())?;
+    let mut txn = source_snapshot
+        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        .with_operation(operation.name().to_string())
+        .with_data_change(operation.data_change());
+    let write_context = txn
+        .write_state()?
+        .write_context_builder()
+        .with_row_tracking_columns(RowTrackingMetadataColumns {
+            row_id: Some("row_id"),
+            row_commit_version: Some("row_commit_version"),
+        })
+        .build()?;
+    let physical_row_id_name = write_context
+        .materialized_row_id_field()
+        .expect("row-tracking write context must expose its materialized row ID field")
+        .name()
+        .to_string();
+    let physical_row_commit_version_name = write_context
+        .materialized_row_commit_version_field()
+        .expect("row-tracking write context must expose its materialized row commit version field")
+        .name()
+        .to_string();
+    let logical_data_schema = write_context.logical_data_schema().clone();
+    let replacement_batch = RecordBatch::try_new(
+        Arc::new(logical_data_schema.as_ref().try_into_arrow()?),
+        vec![
+            Arc::new(Int32Array::from(
+                replacement_rows
+                    .iter()
+                    .map(|row| row.number)
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(Int64Array::from(
+                replacement_rows
+                    .iter()
+                    .map(|row| row.row_id)
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(Int64Array::from(
+                replacement_rows
+                    .iter()
+                    .map(|row| row.row_commit_version)
+                    .collect::<Vec<_>>(),
+            )),
+        ],
+    )?;
+    let add_metadata = engine
+        .write_parquet(&ArrowEngineData::new(replacement_batch), &write_context)
+        .await?;
+    txn.add_files(add_metadata);
+    for scan_files in scan_files {
+        txn.remove_files(scan_files);
+    }
+    txn.ack_row_tracking_preservation();
+
+    let committed = txn.commit(engine.as_ref())?.unwrap_post_commit_snapshot();
+    let commit_version = committed.version();
+    let adds = read_actions_from_commit(&table_url, commit_version, "add")?;
+    assert_eq!(adds.len(), 1);
+    assert_eq!(adds[0]["dataChange"], operation.data_change());
+    assert_eq!(adds[0]["baseRowId"], 3);
+    assert_eq!(adds[0]["defaultRowCommitVersion"], commit_version);
+    let removes = read_actions_from_commit(&table_url, commit_version, "remove")?;
+    assert_eq!(removes.len(), 3);
+    assert!(removes
+        .iter()
+        .all(|remove| remove["dataChange"] == operation.data_change()));
+    let commit_info = read_actions_from_commit(&table_url, commit_version, "commitInfo")?;
+    assert_eq!(commit_info[0]["operation"], operation.name());
+    assert_eq!(
+        commit_info[0]["tags"]["delta.rowTracking.preserved"],
+        "true"
+    );
+
+    let replacement_path = adds[0]["path"]
+        .as_str()
+        .expect("Add action path must be a string");
+    let physical_batch = read_parquet_file(&Path::new(&table_path).join(replacement_path));
+    let physical_numbers = physical_batch
+        .column_by_name("number")
+        .expect("replacement Parquet must contain the number column")
+        .as_primitive::<Int32Type>();
+    let physical_row_ids = physical_batch
+        .column_by_name(&physical_row_id_name)
+        .expect("replacement Parquet must contain the materialized row ID column")
+        .as_primitive::<Int64Type>();
+    let physical_row_commit_versions = physical_batch
+        .column_by_name(&physical_row_commit_version_name)
+        .expect("replacement Parquet must contain the materialized row commit version column")
+        .as_primitive::<Int64Type>();
+    let physical_rows = (0..physical_batch.num_rows())
+        .map(|row| RewriteRow {
+            number: physical_numbers.value(row),
+            row_id: (!physical_row_ids.is_null(row)).then(|| physical_row_ids.value(row)),
+            row_commit_version: (!physical_row_commit_versions.is_null(row))
+                .then(|| physical_row_commit_versions.value(row)),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(physical_rows, replacement_rows);
+
+    let base_row_id = adds[0]["baseRowId"]
+        .as_i64()
+        .expect("baseRowId must be an integer");
+    let commit_version = i64::try_from(commit_version)?;
+    let mut expected_scan_rows = replacement_rows
+        .iter()
+        .enumerate()
+        .map(|(index, row)| RewriteRow {
+            number: row.number,
+            row_id: Some(
+                row.row_id
+                    .unwrap_or(base_row_id + i64::try_from(index).expect("row index fits in i64")),
+            ),
+            row_commit_version: Some(row.row_commit_version.unwrap_or(commit_version)),
+        })
+        .collect::<Vec<_>>();
+    expected_scan_rows.sort_unstable_by_key(|row| row.number);
+    committed.checkpoint(engine.as_ref(), None)?;
+    let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    let rows_after = read_rows_for_rewrite(reloaded, engine.clone())?;
+    assert_eq!(rows_after, expected_scan_rows);
+    operation.assert_scan_semantics(&scanned_rows, &rows_after, commit_version);
+    assert_eq!(
+        rows_after
+            .iter()
+            .map(|row| row.row_id.expect("scan must materialize stable row IDs"))
+            .collect::<HashSet<_>>()
+            .len(),
+        rows_after.len(),
+    );
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RewriteOperation {
+    Update,
+    Merge,
+    Optimize,
+}
+
+impl RewriteOperation {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Update => "UPDATE",
+            Self::Merge => "MERGE",
+            Self::Optimize => "OPTIMIZE",
+        }
+    }
+
+    fn data_change(self) -> bool {
+        self != Self::Optimize
+    }
+
+    fn apply(self, rows: &[RewriteRow]) -> Vec<RewriteRow> {
+        let mut rows = rows.to_vec();
+        rows.sort_unstable_by_key(|row| row.number);
+        match self {
+            Self::Update => rows
+                .into_iter()
+                .map(|row| {
+                    if row.number == 2 {
+                        RewriteRow {
+                            number: 20,
+                            row_commit_version: None,
+                            ..row
+                        }
+                    } else {
+                        row
+                    }
+                })
+                .collect(),
+            Self::Merge => {
+                let mut output = rows
+                    .into_iter()
+                    .filter_map(|row| match row.number {
+                        2 => Some(RewriteRow {
+                            number: 20,
+                            row_commit_version: None,
+                            ..row
+                        }),
+                        3 => None,
+                        _ => Some(row),
+                    })
+                    .collect::<Vec<_>>();
+                output.push(RewriteRow {
+                    number: 4,
+                    row_id: None,
+                    row_commit_version: None,
+                });
+                output
+            }
+            Self::Optimize => {
+                rows.reverse();
+                rows
+            }
+        }
+    }
+
+    fn assert_scan_semantics(
+        self,
+        before: &[RewriteRow],
+        after: &[RewriteRow],
+        rewrite_commit_version: i64,
+    ) {
+        let before = before
+            .iter()
+            .map(|row| {
+                (
+                    row.number,
+                    (
+                        row.row_id.expect("scan must materialize stable row IDs"),
+                        row.row_commit_version
+                            .expect("scan must materialize stable row commit versions"),
+                    ),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let after = after
+            .iter()
+            .map(|row| {
+                (
+                    row.number,
+                    (
+                        row.row_id.expect("scan must materialize stable row IDs"),
+                        row.row_commit_version
+                            .expect("scan must materialize stable row commit versions"),
+                    ),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+
+        match self {
+            Self::Update => {
+                assert_eq!(
+                    after.keys().copied().collect::<HashSet<_>>(),
+                    HashSet::from([1, 3, 20])
+                );
+                assert_eq!(after[&1], before[&1]);
+                assert_eq!(after[&3], before[&3]);
+                assert_eq!(after[&20], (before[&2].0, rewrite_commit_version));
+            }
+            Self::Merge => {
+                assert_eq!(
+                    after.keys().copied().collect::<HashSet<_>>(),
+                    HashSet::from([1, 4, 20])
+                );
+                assert_eq!(after[&1], before[&1]);
+                assert_eq!(after[&20], (before[&2].0, rewrite_commit_version));
+                assert_eq!(after[&4].1, rewrite_commit_version);
+                assert!(before.values().all(|(row_id, _)| *row_id != after[&4].0));
+            }
+            Self::Optimize => assert_eq!(after, before),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RewriteRow {
+    number: i32,
+    row_id: Option<i64>,
+    row_commit_version: Option<i64>,
+}
+
+fn read_rows_for_rewrite(
+    snapshot: Arc<Snapshot>,
+    engine: Arc<dyn Engine>,
+) -> DeltaResult<Vec<RewriteRow>> {
+    let scan_schema = Arc::new(
+        snapshot
+            .schema()
+            .add_metadata_column("row_id", MetadataColumnSpec::RowId)?
+            .add_metadata_column("row_commit_version", MetadataColumnSpec::RowCommitVersion)?,
+    );
+    let scan = snapshot.scan_builder().with_schema(scan_schema).build()?;
+    let mut rows = Vec::new();
+    for batch in read_scan(&scan, engine)? {
+        let numbers = batch
+            .column_by_name("number")
+            .expect("scan must contain the number column")
+            .as_primitive::<Int32Type>();
+        let row_ids = batch
+            .column_by_name("row_id")
+            .expect("scan must contain stable row IDs")
+            .as_primitive::<Int64Type>();
+        let row_commit_versions = batch
+            .column_by_name("row_commit_version")
+            .expect("scan must contain stable row commit versions")
+            .as_primitive::<Int64Type>();
+        assert_eq!(row_ids.null_count(), 0);
+        assert_eq!(row_commit_versions.null_count(), 0);
+        rows.extend((0..batch.num_rows()).map(|row| RewriteRow {
+            number: numbers.value(row),
+            row_id: Some(row_ids.value(row)),
+            row_commit_version: Some(row_commit_versions.value(row)),
+        }));
+    }
+    rows.sort_unstable_by_key(|row| row.number);
+    Ok(rows)
 }

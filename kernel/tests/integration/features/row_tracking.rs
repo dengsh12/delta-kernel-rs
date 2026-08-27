@@ -1207,27 +1207,7 @@ async fn test_write_context_exposes_configured_materialized_row_tracking_fields(
     Ok(())
 }
 
-/// Collect `(number, row_id)` pairs from a row-id scan, keyed by the `number` data column.
-fn collect_number_to_row_id(batches: &[RecordBatch]) -> HashMap<i32, i64> {
-    let mut map = HashMap::new();
-    for batch in batches {
-        let numbers = batch
-            .column_by_name("number")
-            .expect("number column not found")
-            .as_primitive::<Int32Type>();
-        let row_ids = batch
-            .column_by_name("row_id")
-            .expect("row_id column not found")
-            .as_primitive::<Int64Type>();
-        for i in 0..batch.num_rows() {
-            map.insert(numbers.value(i), row_ids.value(i));
-        }
-    }
-    map
-}
-
-/// Deletion vector: must not renumber the surviving rows' stable row IDs and not change any row
-/// tracking metadata.
+/// Deletion-vector updates preserve stable row IDs and row commit versions for surviving rows.
 #[rstest]
 #[case::middle(&[4, 5, 6])]
 #[case::first(&[0, 1, 2])]
@@ -1235,7 +1215,7 @@ fn collect_number_to_row_id(batches: &[RecordBatch]) -> HashMap<i32, i64> {
 #[case::first_and_last(&[0, 1, 8, 9])]
 #[case::first_middle_last(&[0, 4, 5, 9])]
 #[tokio::test]
-async fn test_read_row_ids_stable_across_deletion_vector_update(
+async fn test_read_stable_values_preserved_across_deletion_vector_update(
     #[case] deleted_indexes: &[u64],
 ) -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
@@ -1260,17 +1240,17 @@ async fn test_read_row_ids_stable_across_deletion_vector_update(
     // Snapshot the (value -> row_id) mapping before any deletion. value v sits at physical index
     // (v - 100), and with baseRowId 0 that is also its row ID.
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-    let before = collect_number_to_row_id(&read_metadata_scan(
+    let before = collect_number_to_stable_values(&read_metadata_scan(
         snapshot.clone(),
         engine.clone(),
-        ROW_ID_METADATA_COLUMNS,
+        STABLE_ROW_TRACKING_METADATA_COLUMNS,
     )?);
     assert_eq!(
         before,
         (100..110)
-            .map(|v| (v, (v - 100) as i64))
+            .map(|v| (v, ((v - 100) as i64, 1)))
             .collect::<HashMap<_, _>>(),
-        "row IDs must equal each row's physical index before deletion"
+        "stable values must come from the original Add before deletion"
     );
 
     // The original Add's row-tracking fields, to confirm they survive the DV update unchanged.
@@ -1298,23 +1278,24 @@ async fn test_read_row_ids_stable_across_deletion_vector_update(
             .into_iter()
             .map(Ok),
     )?;
+    txn.ack_row_tracking_preservation();
     txn.commit(engine.as_ref())?.unwrap_committed();
 
-    // Every survivor keeps the exact row ID it had before.
+    // Every survivor keeps the exact stable values it had before.
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-    let after = collect_number_to_row_id(&read_metadata_scan(
+    let after = collect_number_to_stable_values(&read_metadata_scan(
         snapshot,
         engine.clone(),
-        ROW_ID_METADATA_COLUMNS,
+        STABLE_ROW_TRACKING_METADATA_COLUMNS,
     )?);
 
-    let expected_survivors: HashMap<i32, i64> = (100..110)
+    let expected_survivors: HashMap<i32, (i64, i64)> = (100..110)
         .filter(|v| !deleted_indexes.contains(&((v - 100) as u64)))
-        .map(|v| (v, (v - 100) as i64))
+        .map(|v| (v, ((v - 100) as i64, 1)))
         .collect();
     assert_eq!(
         after, expected_survivors,
-        "surviving rows must keep their original row IDs, not be renumbered"
+        "surviving rows must keep their original stable values"
     );
 
     // The DV update must preserve the original row-tracking fields on the rewritten Add.
@@ -1324,6 +1305,11 @@ async fn test_read_row_ids_stable_across_deletion_vector_update(
     assert_eq!(
         updated_add["defaultRowCommitVersion"].as_i64(),
         original_default_row_commit_version,
+    );
+    let commit_info = read_actions_from_commit(&table_url, 2, "commitInfo")?;
+    assert_eq!(
+        commit_info[0]["tags"]["delta.rowTracking.preserved"],
+        "true"
     );
 
     Ok(())

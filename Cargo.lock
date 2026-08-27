@@ -2948,6 +2948,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "optimize-row-tracking-table"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "common",
+ "delta_kernel",
+ "delta_kernel_default_engine",
+ "env_logger",
+ "tokio",
+ "url",
+]
+
+[[package]]
 name = "ordered-float"
 version = "2.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

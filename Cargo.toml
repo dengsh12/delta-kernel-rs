@@ -18,6 +18,7 @@ members = [
 ]
 # note that in addition to the members above, the workspace includes examples:
 # - inspect-table
+# - optimize-row-tracking-table
 # - read-table-changes
 # - read-table-multi-threaded
 # - read-table-single-threaded
