@@ -45,6 +45,19 @@ message ScanJsonNode {
 message ValuesRow {
   repeated delta.kernel.expressions.Scalar values = 1;
 }
+
+message JsonFieldAlias {
+  string alias = 1;
+  string canonical = 2;
+}
+
+// Exactly one JSON object, with strict schema types, required fields, and unique keys.
+// Reject alias/canonical conflicts, including when either supplied value is null.
+message ReadJsonObjectNode {
+  FileMeta file = 1;
+  delta.kernel.schema.StructType schema = 2;
+  repeated JsonFieldAlias aliases = 3;
+}
 message ValuesNode {
   delta.kernel.schema.StructType schema = 1;
   repeated ValuesRow rows = 2;
@@ -133,6 +146,73 @@ message SemiJoinNode {
   repeated delta.kernel.expressions.ColumnName build_keys = 3;
 }
 
+message ValidationAggregate {
+  enum Function {
+    FUNCTION_UNSPECIFIED = 0;
+    COUNT_STAR = 1;
+    COUNT = 2;
+    SUM = 3;
+  }
+  Function function = 1;
+  delta.kernel.expressions.ColumnName column = 2;
+}
+
+message AggregateCheck {
+  ValidationAggregate aggregate = 1;
+  delta.kernel.expressions.ColumnName expected = 2;
+  bool required = 3;
+}
+
+// Inputs [actual, expected-singleton]. Preserve actual rows/schema. Accumulate globally over
+// all partitions and compare only at successful exhaustion. Counts and non-negative LONG sums
+// use checked i64 arithmetic; null SUM operands are errors and empty SUM is zero.
+// Optional null expectations disable comparison. Errors may follow yielded rows. Optimizers must
+// retain this operator and cannot push pruning or operand-changing projections beneath it.
+// Early drop, cancellation, upstream errors, or short-circuiting consumers do not validate.
+message ValidateAggregatesNode {
+  repeated AggregateCheck checks = 1;
+  string context = 2;
+}
+
+message ValueNormalization {
+  repeated delta.kernel.expressions.ColumnName unordered_arrays = 1;
+  repeated delta.kernel.expressions.ColumnName json_strings = 2;
+  repeated delta.kernel.expressions.ColumnName ignored_fields = 3;
+}
+
+// Inputs [actual, expected-singleton]. Compare scalars or unordered collections including payload
+// and multiplicity. Keys must be unique before retention exclusion. Null optional expectations
+// mean absent; present empty arrays assert empty state. Normalization paths are value-relative.
+// Emit {field: STRING, status: STRING}: checked, absent, partial, or unavailable. Mismatches error.
+// The error-preservation obligations of ValidateAggregatesNode also apply here.
+message ValidateRelationNode {
+  delta.kernel.expressions.ColumnName actual = 1;
+  delta.kernel.expressions.ColumnName expected = 2;
+  bool collection = 3;
+  repeated delta.kernel.expressions.ColumnName keys = 4;
+  ValueNormalization normalization = 5;
+  bool required = 6;
+  bool available = 7;
+  bool partial = 8;
+  string context = 9;
+  delta.kernel.expressions.ColumnName exclusion_column = 10;
+  optional int64 exclusion_threshold = 11;
+}
+
+// Inputs [actual, expected-singleton]. Exactly one of boundary_column and fixed_boundaries is used.
+// Inclusive lower bounds start at zero and strictly increase; the final bin has no upper bound.
+// Arrays have identical lengths; counts and sums are non-negative LONGs with checked arithmetic.
+// Null actual values error. Empty bins are zero. Output/optimizer rules match ValidateRelationNode.
+message ValidateHistogramNode {
+  delta.kernel.expressions.ColumnName value = 1;
+  delta.kernel.expressions.ColumnName expected = 2;
+  delta.kernel.expressions.ColumnName boundary_column = 3;
+  repeated int64 fixed_boundaries = 4;
+  delta.kernel.expressions.ColumnName counts = 5;
+  delta.kernel.expressions.ColumnName sums = 6;
+  string context = 7;
+}
+
 // ============================================================================
 // Operator
 // ============================================================================
@@ -150,6 +230,10 @@ message Operator {
     DynamicScanNode dynamic_scan = 7;
     AggregateNode aggregate = 8;
     SemiJoinNode semi_join = 9;
+    ValidateAggregatesNode validate_aggregates = 10;
+    ValidateRelationNode validate_relation = 11;
+    ValidateHistogramNode validate_histogram = 12;
+    ReadJsonObjectNode read_json_object = 13;
   }
 }
 

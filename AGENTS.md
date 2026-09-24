@@ -116,6 +116,11 @@ table at a specific version. From it you build a `Scan` (reads) or `Transaction`
 `execute()` (simple), `scan_metadata()` (advanced/distributed),
 `parallel_scan_metadata()` (two-phase distributed log replay).
 
+Under `declarative-plans`, `ScanBuilder::with_checksum_validation()` checks file totals on unpruned
+declarative scans, and `Snapshot::validate_checksum(engine)` builds independent CRC validation
+plans with per-field coverage. Validation requires exhaustion; a partial read is not a successful
+check. Reconciliation and collection comparison stay inside the engine.
+
 
 **Write path:** `Snapshot` -> `Transaction` -> `commit()`. Writers call
 `Transaction::write_state`, then bind partition values through the returned `WriteState` to get a

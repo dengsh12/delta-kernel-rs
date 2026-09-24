@@ -57,6 +57,21 @@
 //!
 //! The generic [`PlanExecutor`] path remains required for operations whose results kernel consumes.
 //!
+//! # Checksum validation
+//!
+//! [`ScanBuilder::with_checksum_validation`](crate::scan::ScanBuilder::with_checksum_validation)
+//! attaches same-version file-count and byte-size checks to an unpruned metadata scan. Missing
+//! checksums leave scans usable.
+//! [`Snapshot::validate_checksum`](crate::Snapshot::validate_checksum) independently reconstructs
+//! checkpoint/log state and returns per-field coverage statuses. It requires a same-version
+//! checksum and does not read customer data files or DV bitmaps.
+//!
+//! Validation operators in [`ir::validation`] have observable errors. Optimizers must preserve
+//! them and must not push pruning below pass-through checks. Aggregates cover every partition and
+//! use checked integer arithmetic. A pass-through check may fail after yielding rows; exhaust its
+//! input to establish completion. LIMIT, cancellation, and short-circuiting joins cannot establish
+//! successful validation. Native connector execution has the same obligations.
+//!
 //! [`Scan::declarative_metadata_scan_plan`]: crate::scan::Scan::declarative_metadata_scan_plan
 //!
 //! # Where to look

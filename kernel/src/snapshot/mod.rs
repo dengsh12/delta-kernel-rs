@@ -42,6 +42,8 @@ use crate::utils::require;
 use crate::{DeltaResult, Engine, Error, LogCompactionWriter, Version};
 
 mod builder;
+#[cfg(feature = "declarative-plans")]
+mod checksum_validation;
 mod incremental;
 mod snapshot_crc;
 #[cfg(test)]

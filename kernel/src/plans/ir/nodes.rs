@@ -11,6 +11,7 @@ use itertools::Itertools;
 use strum::Display;
 use url::Url;
 
+use super::validation::{ValidateAggregates, ValidateHistogram, ValidateRelation};
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::error::add_scalar_path_context;
 use crate::expressions::{ColumnName, ExpressionRef, PredicateRef, Scalar, StructData};
@@ -34,6 +35,7 @@ pub enum Operator {
     // === Source operators (0 inputs) =========================================
     ScanParquet(ScanParquet),
     ScanJson(ScanJson),
+    ReadJsonObject(ReadJsonObject),
     Values(Values),
 
     // === Unary operators (1 input) ===========================================
@@ -44,6 +46,9 @@ pub enum Operator {
 
     // === Binary operators (2 inputs) =========================================
     SemiJoin(SemiJoin),
+    ValidateAggregates(ValidateAggregates),
+    ValidateRelation(ValidateRelation),
+    ValidateHistogram(ValidateHistogram),
 
     // === N-ary operators (variable inputs) ===================================
     UnionAll(UnionAll),
@@ -188,6 +193,21 @@ pub struct ScanJson {
     pub files: Vec<ScanFile>,
     pub file_constant_columns: Vec<String>,
     pub schema: SchemaRef,
+}
+
+/// Reads exactly one JSON object from `file`, validating types and required fields against
+/// `schema`. Unlike newline-delimited scans, this accepts a formatted object but rejects multiple
+/// objects, duplicate keys, and primitive coercions. Unknown fields are ignored. Each `(alias,
+/// canonical)` pair permits either name, but supplying both is an error even if either value is
+/// NULL.
+#[derive(Debug, Clone)]
+pub struct ReadJsonObject {
+    /// File containing the object.
+    pub file: FileMeta,
+    /// Expected output shape, including required-field nullability.
+    pub schema: SchemaRef,
+    /// Alternative top-level field names.
+    pub aliases: Vec<(String, String)>,
 }
 
 /// Inline literal rows. Each `rows[i]` carries one [`Scalar`] per **top-level** field

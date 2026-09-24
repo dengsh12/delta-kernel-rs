@@ -13,8 +13,10 @@
 use std::sync::Arc;
 
 pub mod json;
+pub mod json_object;
 pub mod parquet;
 pub mod storage;
+pub mod validation;
 
 use json::PlanBasedJsonHandler;
 use parquet::PlanBasedParquetHandler;

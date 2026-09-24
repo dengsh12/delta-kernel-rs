@@ -1,8 +1,12 @@
 # CLAUDE.md -- datafusion-executor
 
-`datafusion_executor` is a DataFusion-based `PlanExecutor` for delta_kernel declarative plans.
-Kernel emits executor-independent logical `Plan`s; this crate executes them by lowering each
-plan to a DataFusion `LogicalPlan`, optimizing it, and running the resulting `ExecutionPlan`.
+`datafusion_executor` provides DataFusion lowering for delta_kernel declarative plans. Relational
+operators, validation barriers, and strict singleton JSON sources have executable lowerings.
+General file scans, dynamic scans, and the public `PlanExecutor` implementation remain incomplete.
+
+Validation uses a custom query planner and validation-preserving logical optimizer wrappers.
+Use the configured session context when testing validation: an ordinary DataFusion context does
+not know the extension node and may erase assertions through SQL empty-relation rewrites.
 
 ## Separate workspace
 

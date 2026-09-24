@@ -42,14 +42,18 @@ use std::sync::Arc;
 use delta_kernel_derive::internal_api;
 
 use super::ir::nodes::{
-    Aggregate, AggregateBuilder, DynamicScan, FileType, Filter, Operator, Project, ScanFile,
-    ScanJson, ScanParquet, SemiJoin, UnionAll, Values,
+    Agg, Aggregate, AggregateBuilder, DynamicScan, FileType, Filter, Operator, Project,
+    ReadJsonObject, ScanFile, ScanJson, ScanParquet, SemiJoin, UnionAll, Values,
 };
 use super::ir::plan::{Plan, PlanNode};
+use super::ir::validation::{
+    validation_result_schema, AggregateCheck, HistogramBoundaries, ValidateAggregates,
+    ValidateHistogram, ValidateRelation, ValidationAggregate,
+};
 use crate::expressions::{ColumnName, ExpressionRef, PredicateRef, Scalar, StructData};
-use crate::schema::{SchemaRef, ToSchema};
+use crate::schema::{DataType, SchemaRef, ToSchema};
 use crate::struct_patch::ProjectionStructPatchBuilder;
-use crate::utils::CollectInto;
+use crate::utils::{require, CollectInto};
 use crate::{DeltaResult, Error};
 
 /// One node of a plan DAG: an operator, its inputs, and its output schema. Node identity is the
@@ -203,6 +207,12 @@ impl PlanBuilder {
             }
         }
         Ok(Values::new(schema, rows).into())
+    }
+
+    /// Reads one strictly typed JSON object. See [`ReadJsonObject`]. Shape and alias violations
+    /// are reported during execution.
+    pub fn read_json_object(source: ReadJsonObject) -> Self {
+        Self::present(source.schema.clone(), source, vec![])
     }
 
     /// Infallible sibling of [`Self::values`] containing rows of `T` converted to scalar data.
@@ -421,6 +431,91 @@ impl PlanBuilder {
         self.aggregate(aggs(builder))
     }
 
+    /// Validates global aggregates against the singleton `expected` relation while preserving
+    /// this relation's rows. See [`ValidateAggregates`] for completion and error semantics.
+    ///
+    /// Errors when a referenced column is missing or an integer operand has the wrong type.
+    pub fn validate_aggregates(
+        self,
+        expected: Self,
+        validation: ValidateAggregates,
+    ) -> DeltaResult<Self> {
+        for check in &validation.checks {
+            match &check.aggregate {
+                ValidationAggregate::CountStar => (),
+                ValidationAggregate::Count(column) => {
+                    check_columns_resolve(self.schema(), [column], "validate count")?;
+                }
+                ValidationAggregate::Sum(column) => {
+                    check_long_column(self.schema(), column)?;
+                }
+            }
+            check_long_column(expected.schema(), &check.expected)?;
+        }
+        let schema = self.schema().clone();
+        Ok(Self::present(
+            schema,
+            validation,
+            vec![self.materialized_root(), expected.materialized_root()],
+        ))
+    }
+
+    /// Compares this relation with a scalar or collection in `expected` inside the engine.
+    /// Returns a bounded status relation. See [`ValidateRelation`].
+    ///
+    /// Errors when a compared column is absent or the expected collection is not an array of
+    /// the actual column's type.
+    pub fn validate_relation(
+        self,
+        expected: Self,
+        validation: ValidateRelation,
+    ) -> DeltaResult<Self> {
+        let actual_fields = self.schema().fields_of_path(&validation.actual)?;
+        let expected_fields = expected.schema().fields_of_path(&validation.expected)?;
+        let actual_type = actual_fields.last().map(|f| f.data_type());
+        let expected_type = expected_fields.last().map(|f| f.data_type());
+        let expected_type = match (validation.collection, expected_type) {
+            (true, Some(DataType::Array(array))) => Some(array.element_type()),
+            (false, ty) => ty,
+            _ => None,
+        };
+        require!(
+            actual_type.is_some() && actual_type == expected_type,
+            Error::generic("validation actual and expected types must match")
+        );
+        Ok(Self::present(
+            validation_result_schema(),
+            validation,
+            vec![self.materialized_root(), expected.materialized_root()],
+        ))
+    }
+
+    /// Validates this relation's distribution against `expected` and returns a bounded status.
+    /// See [`ValidateHistogram`]. Errors when a referenced column is absent or the actual values
+    /// are not LONGs. The engine validates histogram shapes and boundaries at execution time.
+    pub fn validate_histogram(
+        self,
+        expected: Self,
+        validation: ValidateHistogram,
+    ) -> DeltaResult<Self> {
+        check_long_column(self.schema(), &validation.value)?;
+        check_columns_resolve(
+            expected.schema(),
+            [&validation.expected, &validation.counts]
+                .into_iter()
+                .chain(validation.sums.iter()),
+            "validate histogram",
+        )?;
+        if let HistogramBoundaries::Column(column) = &validation.boundaries {
+            check_columns_resolve(expected.schema(), [column], "histogram boundaries")?;
+        }
+        Ok(Self::present(
+            validation_result_schema(),
+            validation,
+            vec![self.materialized_root(), expected.materialized_root()],
+        ))
+    }
+
     /// Semi join: emit the `self` (probe) rows that have a match in `build` on the join keys.
     /// Output schema mirrors `self`. Inputs are recorded as `[probe, build]`. See [`SemiJoin`].
     ///
@@ -481,6 +576,32 @@ impl PlanBuilder {
         }
         check_columns_resolve(self.schema(), &probe_keys, "join probe")?;
         check_columns_resolve(build.schema(), &build_keys, "join build")?;
+        // Empty-side folding must not erase assertions on the other side.
+        let has_validation = |plan: &Self| -> DeltaResult<bool> {
+            Ok(plan.build()?.nodes.iter().any(|node| {
+                matches!(
+                    node.op,
+                    Operator::ValidateAggregates(_)
+                        | Operator::ValidateRelation(_)
+                        | Operator::ValidateHistogram(_)
+                )
+            }))
+        };
+        if (matches!(&self.0, PlanBuilderRoot::Absent(_))
+            || matches!(&build.0, PlanBuilderRoot::Absent(_)))
+            && (has_validation(&self)? || has_validation(&build)?)
+        {
+            let schema = self.schema().clone();
+            return Ok(Self::present(
+                schema,
+                SemiJoin {
+                    inverted,
+                    probe_keys,
+                    build_keys,
+                },
+                vec![self.materialized_root(), build.materialized_root()],
+            ));
+        }
         // An uninhabited probe always produces an uninhabited result; forward it unchanged.
         let PlanBuilderRoot::Present(probe) = self.0 else {
             return Ok(self);
@@ -564,6 +685,41 @@ impl PlanBuilder {
         })
     }
 
+    /// Rejects duplicate key tuples without relying on an aggregate's tie-breaking order.
+    pub(crate) fn validate_unique(
+        self,
+        keys: impl IntoIterator<Item = ColumnName>,
+        context: String,
+    ) -> DeltaResult<Self> {
+        let distinct = self
+            .clone()
+            .aggregate_by(keys, |a| a.count_star())?
+            .aggregate_ungrouped(|a| a.aggregate_as(Agg::CountStar, "distinctKeys"))?;
+        self.validate_aggregates(
+            distinct,
+            ValidateAggregates {
+                checks: vec![AggregateCheck {
+                    aggregate: ValidationAggregate::CountStar,
+                    expected: ColumnName::new(["distinctKeys"]),
+                    required: true,
+                }],
+                context,
+            },
+        )
+    }
+
+    // Assertions must execute even when their actual input is statically empty.
+    fn materialized_root(self) -> BuilderNodeRef {
+        match self.0 {
+            PlanBuilderRoot::Present(node) => node,
+            PlanBuilderRoot::Absent(schema) => Arc::new(BuilderNode {
+                op: Values::new(schema.clone(), vec![]).into(),
+                inputs: vec![],
+                schema,
+            }),
+        }
+    }
+
     /// Linearize the DAG rooted at `root` into a topologically sorted [`Plan`] with `root` as the
     /// last (terminal) node. A node's inputs always precede it, referenced by their index in
     /// [`Plan::nodes`]. Shared subgraphs are emitted once; multiple nodes can reference them.
@@ -641,6 +797,17 @@ fn check_file_constant_columns<'a>(
             )));
         }
     }
+    Ok(())
+}
+
+fn check_long_column(schema: &SchemaRef, column: &ColumnName) -> DeltaResult<()> {
+    let fields = schema.fields_of_path(column)?;
+    require!(
+        fields
+            .last()
+            .is_some_and(|field| field.data_type() == &DataType::LONG),
+        Error::generic(format!("validation column {column} must be LONG"))
+    );
     Ok(())
 }
 

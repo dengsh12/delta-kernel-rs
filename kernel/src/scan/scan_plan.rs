@@ -58,10 +58,21 @@ impl Scan {
         &self,
         shape: &CheckpointShape,
     ) -> DeltaResult<Option<Plan>> {
+        self.metadata_scan_relation(shape, false /* validate_checksum */)?
+            .build_opt()
+    }
+
+    pub(super) fn metadata_scan_relation(
+        &self,
+        shape: &CheckpointShape,
+        validate_checksum: bool,
+    ) -> DeltaResult<PlanBuilder> {
         let state = &self.state_info;
         // A statically-unsatisfiable predicate (e.g. `x > 10 AND FALSE`) skips the whole table.
         if state.physical_predicate == PhysicalPredicate::StaticSkipAll {
-            return Ok(None);
+            let add_field = self.normalized_add_field()?;
+            let (_, schema) = self.metadata_output_projection(&add_field)?;
+            return PlanBuilder::values(schema, vec![]);
         }
 
         let prune = stats_skipping_predicate(state);
@@ -91,6 +102,17 @@ impl Scan {
             p.filter(Predicate::or(col!("add").is_null(), prune.clone()))
         })?;
 
+        let commit_actions = if validate_checksum {
+            commit_actions.validate_unique(
+                [column_name!(FILE_ACTION_KEY), column_name!(VERSION)],
+                format!(
+                    "checksum at table version {}: ambiguous file actions",
+                    self.snapshot.version()
+                ),
+            )?
+        } else {
+            commit_actions
+        };
         let deduped_commit = commit_actions.aggregate_by([column_name!(FILE_ACTION_KEY)], |a| {
             // Each group with a non-null FILE_ACTION_KEY contains the adds and removes for a given
             // file; winning adds pass through unchanged while winning removes produce NULL. Non-
@@ -105,6 +127,17 @@ impl Scan {
         let checkpoint_adds = self
             .checkpoint_arm(shape)?
             .try_fold_with(prune, |p, prune| p.filter(prune.clone()))?;
+        let checkpoint_adds = if validate_checksum {
+            checkpoint_adds.validate_unique(
+                [column_name!(FILE_ACTION_KEY)],
+                format!(
+                    "checksum at table version {}: duplicate checkpoint file",
+                    self.snapshot.version()
+                ),
+            )?
+        } else {
+            checkpoint_adds
+        };
 
         let checkpoint_live_adds = checkpoint_adds
             .anti_join(
@@ -118,7 +151,7 @@ impl Scan {
             .filter(col!("add").is_not_null())?
             .project(output_expr, output_schema)?;
 
-        PlanBuilder::union_all([commit_live_adds, checkpoint_live_adds])?.build_opt()
+        PlanBuilder::union_all([commit_live_adds, checkpoint_live_adds])
     }
 
     /// Build normalized checkpoint adds. Returns an empty relation when no checkpoint exists.
@@ -336,7 +369,7 @@ impl Scan {
 }
 
 /// Read actions from V2 checkpoint sidecars.
-fn sidecar_actions(
+pub(crate) fn sidecar_actions(
     file_type: FileType,
     root_parts: Vec<ScanFile>,
     action_schema: SchemaRef,
@@ -425,7 +458,7 @@ fn parquet_read_schema(
 }
 
 /// File identity used for replay.
-static FILE_ACTION_KEY_FIELD: LazyLock<StructField> = LazyLock::new(|| {
+pub(crate) static FILE_ACTION_KEY_FIELD: LazyLock<StructField> = LazyLock::new(|| {
     let schema = schema! {
         nullable "path": STRING,
         nullable "deletionVector": {
@@ -438,7 +471,7 @@ static FILE_ACTION_KEY_FIELD: LazyLock<StructField> = LazyLock::new(|| {
 });
 
 /// Build a file identity from path and deletion vector.
-fn file_action_key_expr(key_col_expr: impl Fn(ColumnName) -> Expr) -> Expr {
+pub(crate) fn file_action_key_expr(key_col_expr: impl Fn(ColumnName) -> Expr) -> Expr {
     let storage_type = key_col_expr(column_name!("deletionVector.storageType"));
     Expr::struct_from([
         key_col_expr(column_name!("path")),

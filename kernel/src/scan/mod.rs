@@ -275,6 +275,8 @@ pub struct ScanBuilder {
     without_row_transforms: bool,
     partition_values: PartitionValuesOptions,
     cancellation_token: Option<CancellationTokenRef>,
+    #[cfg(feature = "declarative-plans")]
+    checksum_validation: bool,
 }
 
 impl std::fmt::Debug for ScanBuilder {
@@ -302,7 +304,20 @@ impl ScanBuilder {
             without_row_transforms: false,
             partition_values: PartitionValuesOptions::default(),
             cancellation_token: None,
+            #[cfg(feature = "declarative-plans")]
+            checksum_validation: false,
         }
+    }
+
+    /// Enables same-version CRC file-total validation for declarative metadata scans.
+    ///
+    /// Missing CRCs leave ordinary scans available. Predicate scans are rejected when validation
+    /// is enabled. Exhaust the resulting plan's stream to establish validation; errors may follow
+    /// yielded batches. This option does not change the imperative scan APIs.
+    #[cfg(feature = "declarative-plans")]
+    pub fn with_checksum_validation(mut self) -> Self {
+        self.checksum_validation = true;
+        self
     }
 
     /// Provide [`Schema`] for columns to select from the [`Snapshot`].
@@ -484,6 +499,8 @@ impl ScanBuilder {
             correlation_id: self.correlation_id,
             partition_values: self.partition_values,
             cancellation_token: self.cancellation_token,
+            #[cfg(feature = "declarative-plans")]
+            checksum_validation: self.checksum_validation,
         })
     }
 }
@@ -742,6 +759,8 @@ pub struct Scan {
     /// Optional cooperative cancellation token supplied via
     /// [`ScanBuilder::with_cancellation_token`]. `None` means the scan is not cancellable.
     cancellation_token: Option<CancellationTokenRef>,
+    #[cfg(feature = "declarative-plans")]
+    checksum_validation: bool,
 }
 
 /// Builds the physical `stats_parsed` output schema requested through `StatsOptions`.
@@ -1143,6 +1162,10 @@ impl Scan {
         err
     )]
     pub fn declarative_metadata_scan_plan(&self, engine: &dyn Engine) -> DeltaResult<Option<Plan>> {
+        if self.checksum_validation && self.state_info.physical_predicate != PhysicalPredicate::None
+        {
+            return Err(Error::unsupported("checksum validation of predicate scans"));
+        }
         // Resolve the checkpoint shape once: it selects the leaf-vs-manifest arm and reports
         // whether the checkpoint carries a compatible parsed-stats column.
         let plan_executor = engine.require_plan_executor()?;
@@ -1151,6 +1174,15 @@ impl Scan {
             &self.snapshot,
             self.state_info.physical_stats_schema.as_ref(),
         )?;
+        if self.checksum_validation {
+            if let Some(expected) = self.snapshot.checksum_input_plan(engine)? {
+                return self
+                    .metadata_scan_relation(&shape, true /* validate_checksum */)?
+                    .validate_aggregates(expected, self.snapshot.file_totals_validation())?
+                    .build()
+                    .map(Some);
+            }
+        }
         self.build_metadata_scan_plan(&shape)
     }
 

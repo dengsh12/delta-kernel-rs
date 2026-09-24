@@ -1,9 +1,9 @@
-//! A DataFusion-based [`PlanExecutor`](delta_kernel::PlanExecutor) for delta_kernel declarative
-//! plans.
+//! DataFusion lowering for delta_kernel declarative plans.
 //!
-//! Kernel emits executor-independent logical [`Plan`](delta_kernel::plans::ir::plan::Plan)s; this
-//! crate executes them by lowering each plan to a DataFusion `LogicalPlan`, optimizing it, and
-//! running the resulting `ExecutionPlan`.
+//! Kernel emits executor-independent logical [`Plan`](delta_kernel::plans::ir::plan::Plan)s.
+//! Relational operators, validation barriers, and strict singleton JSON sources can be lowered
+//! and executed through a configured DataFusion context. General file scans, dynamic scans, and
+//! [`PlanExecutor`](delta_kernel::PlanExecutor) dispatch are not implemented.
 
 // TODO: remove once `session_ctx` and `storage_handler` are consumed by the query-execution path.
 #![allow(dead_code)]
@@ -14,17 +14,19 @@ use datafusion::execution::context::SessionContext;
 use delta_kernel::StorageHandler;
 
 mod expression;
+mod json_object;
 mod operator;
 mod plan;
 mod predicate;
 mod scalar;
 mod utils;
+mod validation;
 
 pub use expression::to_df_expr;
 pub use predicate::to_df_predicate_expr;
 pub use scalar::to_df_scalar;
 
-/// Executes kernel declarative plans on DataFusion.
+/// Holds the execution context and storage handler for DataFusion plan execution.
 ///
 /// Holds two handles, each owning a distinct part of the work:
 /// - `session_ctx` -- *plan it, then run it*: DataFusion's `SessionContext` is the front door to
@@ -47,7 +49,7 @@ pub struct DataFusionExecutor {
 impl DataFusionExecutor {
     pub fn new(storage_handler: Arc<dyn StorageHandler>) -> Self {
         Self {
-            session_ctx: SessionContext::new(),
+            session_ctx: validation::session_context(),
             storage_handler,
         }
     }

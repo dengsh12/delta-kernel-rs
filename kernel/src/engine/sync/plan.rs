@@ -32,6 +32,8 @@ use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
 use crate::engine::arrow_expression::evaluate_expression::extract_column_ref;
 use crate::engine::arrow_expression::{extract_column, ArrowEvaluationHandler};
 use crate::engine::arrow_utils::coerce_columns_to_schema;
+use crate::engine::plans::json_object::read_json_object;
+use crate::engine::plans::validation::{validate_histogram, validate_relation, AggregateValidator};
 use crate::expressions::{ArrayData, ColumnName, PredicateRef, Scalar};
 use crate::object_store::DynObjectStore;
 use crate::plans::ir::nodes::{
@@ -156,6 +158,15 @@ impl SyncPlanExecutor {
     ) -> DeltaResult<Vec<RecordBatch>> {
         let PlanNode { op, inputs } = node;
         match op {
+            Operator::ReadJsonObject(source) => {
+                let mut bytes = self
+                    .storage
+                    .read_files(vec![(source.file.location.clone(), None)])?;
+                let bytes = bytes
+                    .next()
+                    .ok_or_else(|| Error::generic("JSON object file returned no bytes"))??;
+                read_json_object(&source, &bytes)
+            }
             Operator::ScanJson(ScanJson {
                 files,
                 file_constant_columns,
@@ -176,6 +187,25 @@ impl SyncPlanExecutor {
                 self.eval_dynamic_scan(dynamic_scan, &results[inputs[0]])
             }
             Operator::Aggregate(aggregate) => eval_aggregate(&aggregate, &results[inputs[0]]),
+            Operator::ValidateAggregates(validation) => {
+                let actual = &results[inputs[0]];
+                let mut validator = AggregateValidator::try_new(validation, &results[inputs[1]])?;
+                for batch in actual {
+                    validator.observe(batch)?;
+                }
+                validator.finish()?;
+                Ok(actual.clone())
+            }
+            Operator::ValidateRelation(validation) => Ok(vec![validate_relation(
+                &validation,
+                &results[inputs[0]],
+                &results[inputs[1]],
+            )?]),
+            Operator::ValidateHistogram(validation) => Ok(vec![validate_histogram(
+                &validation,
+                &results[inputs[0]],
+                &results[inputs[1]],
+            )?]),
             Operator::SemiJoin(join) => {
                 eval_semi_join(join, &results[inputs[0]], &results[inputs[1]])
             }

@@ -1,6 +1,7 @@
 //! Conversions from the kernel plan IR into the prost-generated proto wire types.
 
 use super::plan::agg as proto_agg;
+use super::plan::validation_aggregate::Function as ValidationFunction;
 use super::schema::data_type::Kind as DataTypeKind;
 use super::schema::metadata_value::Value as MetadataValueKind;
 use super::schema::primitive_type::Kind as PrimitiveTypeKind;
@@ -23,6 +24,10 @@ use crate::plans::ir::nodes::{
     ScanParquet, SemiJoin, Values,
 };
 use crate::plans::ir::plan::{Plan, PlanNode};
+use crate::plans::ir::validation::{
+    HistogramBoundaries, ValidateAggregates, ValidateHistogram, ValidateRelation,
+    ValidationAggregate,
+};
 use crate::plans::{IoOperation, Operation};
 use crate::schema::{
     ArrayType, DataType, DecimalType, MapType, MetadataValue, PrimitiveType, StructField,
@@ -145,15 +150,101 @@ impl From<&Operator> for proto_plan::Operator {
         let op = match op {
             Operator::ScanParquet(n) => Op::ScanParquet(n.into()),
             Operator::ScanJson(n) => Op::ScanJson(n.into()),
+            Operator::ReadJsonObject(n) => Op::ReadJsonObject(proto_plan::ReadJsonObjectNode {
+                file: Some((&n.file).into()),
+                schema: Some(n.schema.as_ref().into()),
+                aliases: n
+                    .aliases
+                    .iter()
+                    .map(|(alias, canonical)| proto_plan::JsonFieldAlias {
+                        alias: alias.clone(),
+                        canonical: canonical.clone(),
+                    })
+                    .collect(),
+            }),
             Operator::Values(n) => Op::Values(n.into()),
             Operator::Project(n) => Op::Project(n.into()),
             Operator::Filter(n) => Op::Filter(n.into()),
             Operator::DynamicScan(n) => Op::DynamicScan(n.into()),
             Operator::Aggregate(n) => Op::Aggregate(n.into()),
             Operator::SemiJoin(n) => Op::SemiJoin(n.into()),
+            Operator::ValidateAggregates(n) => Op::ValidateAggregates(n.into()),
+            Operator::ValidateRelation(n) => Op::ValidateRelation(n.into()),
+            Operator::ValidateHistogram(n) => Op::ValidateHistogram(n.into()),
             Operator::UnionAll(_) => Op::UnionAll(proto_plan::UnionAllNode {}),
         };
         proto_plan::Operator { op: Some(op) }
+    }
+}
+
+impl From<&ValidateAggregates> for proto_plan::ValidateAggregatesNode {
+    fn from(node: &ValidateAggregates) -> Self {
+        Self {
+            checks: node
+                .checks
+                .iter()
+                .map(|check| {
+                    let (function, column) = match &check.aggregate {
+                        ValidationAggregate::CountStar => (ValidationFunction::CountStar, None),
+                        ValidationAggregate::Count(column) => {
+                            (ValidationFunction::Count, Some(column.into()))
+                        }
+                        ValidationAggregate::Sum(column) => {
+                            (ValidationFunction::Sum, Some(column.into()))
+                        }
+                    };
+                    proto_plan::AggregateCheck {
+                        aggregate: Some(proto_plan::ValidationAggregate {
+                            function: function as i32,
+                            column,
+                        }),
+                        expected: Some((&check.expected).into()),
+                        required: check.required,
+                    }
+                })
+                .collect(),
+            context: node.context.clone(),
+        }
+    }
+}
+
+impl From<&ValidateRelation> for proto_plan::ValidateRelationNode {
+    fn from(node: &ValidateRelation) -> Self {
+        Self {
+            actual: Some((&node.actual).into()),
+            expected: Some((&node.expected).into()),
+            collection: node.collection,
+            keys: convert_vec(&node.keys),
+            normalization: Some(proto_plan::ValueNormalization {
+                unordered_arrays: convert_vec(&node.normalization.unordered_arrays),
+                json_strings: convert_vec(&node.normalization.json_strings),
+                ignored_fields: convert_vec(&node.normalization.ignored_fields),
+            }),
+            required: node.required,
+            available: node.available,
+            partial: node.partial,
+            context: node.context.clone(),
+            exclusion_column: node.exclude_at_or_below.as_ref().map(|(c, _)| c.into()),
+            exclusion_threshold: node.exclude_at_or_below.as_ref().map(|(_, v)| *v),
+        }
+    }
+}
+
+impl From<&ValidateHistogram> for proto_plan::ValidateHistogramNode {
+    fn from(node: &ValidateHistogram) -> Self {
+        let (boundary_column, fixed_boundaries) = match &node.boundaries {
+            HistogramBoundaries::Column(column) => (Some(column.into()), vec![]),
+            HistogramBoundaries::Fixed(values) => (None, values.clone()),
+        };
+        Self {
+            value: Some((&node.value).into()),
+            expected: Some((&node.expected).into()),
+            boundary_column,
+            fixed_boundaries,
+            counts: Some((&node.counts).into()),
+            sums: node.sums.as_ref().map(Into::into),
+            context: node.context.clone(),
+        }
     }
 }
 
@@ -979,6 +1070,7 @@ mod tests {
     use std::sync::Arc;
 
     use bytes::Bytes;
+    use prost::Message;
     use rstest::rstest;
     use url::Url;
 
@@ -1001,6 +1093,7 @@ mod tests {
         ScanParquet, SemiJoin, UnionAll, Values,
     };
     use crate::plans::ir::plan::{Plan, PlanNode};
+    use crate::plans::ir::validation::{ValidateRelation, ValueNormalization};
     use crate::plans::proto::{
         expressions as proto_expr, operation as proto_op, plan as proto_plan,
         schema as proto_schema,
@@ -1349,8 +1442,58 @@ mod tests {
             Op::Aggregate(_) => "aggregate",
             Op::SemiJoin(_) => "semi_join",
             Op::UnionAll(_) => "union_all",
+            Op::ValidateAggregates(_) => "validate_aggregates",
+            Op::ValidateRelation(_) => "validate_relation",
+            Op::ValidateHistogram(_) => "validate_histogram",
+            Op::ReadJsonObject(_) => "read_json_object",
         };
         assert_eq!(kind, expected);
+    }
+
+    #[rstest]
+    fn validation_relation_wire_preserves_policy(
+        #[values(false, true)] available: bool,
+        #[values(false, true)] partial: bool,
+        #[values(None, Some(123))] cutoff: Option<i64>,
+    ) {
+        let relation = ValidateRelation {
+            actual: column_name!("txn"),
+            expected: column_name!("setTransactions"),
+            collection: true,
+            keys: vec![column_name!("appId")],
+            exclude_at_or_below: cutoff.map(|value| (column_name!("lastUpdated"), value)),
+            normalization: ValueNormalization {
+                unordered_arrays: vec![column_name!("features")],
+                json_strings: vec![column_name!("stats")],
+                ignored_fields: vec![column_name!("dataChange")],
+            },
+            required: true,
+            available,
+            partial,
+            context: "version 7".into(),
+        };
+        let wire = proto_plan::ValidateRelationNode::from(&relation);
+        let node =
+            proto_plan::ValidateRelationNode::decode(wire.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(node.actual.as_ref().unwrap().path, vec!["txn"]);
+        assert_eq!(
+            node.expected.as_ref().unwrap().path,
+            vec!["setTransactions"]
+        );
+        assert_eq!(node.keys[0].path, vec!["appId"]);
+        assert!(node.collection && node.required);
+        assert_eq!(node.available, available);
+        assert_eq!(node.partial, partial);
+        assert_eq!(node.exclusion_threshold, cutoff);
+        assert_eq!(
+            node.exclusion_column.as_ref().map(|c| c.path.clone()),
+            cutoff.map(|_| vec!["lastUpdated".to_owned()])
+        );
+        let normalization = node.normalization.as_ref().unwrap();
+        assert_eq!(normalization.unordered_arrays[0].path, vec!["features"]);
+        assert_eq!(normalization.json_strings[0].path, vec!["stats"]);
+        assert_eq!(normalization.ignored_fields[0].path, vec!["dataChange"]);
+        assert_eq!(node.context, "version 7");
     }
 
     #[test]

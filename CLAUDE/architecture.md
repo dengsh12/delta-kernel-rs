@@ -50,6 +50,14 @@ protocol/metadata provenance, `max_published_version`, and freshness.
 From a snapshot you can: read the schema and table properties, build a `Scan` to read data,
 start a `Transaction` to write data, or create a checkpoint.
 
+Under `declarative-plans`, `Snapshot::validate_checksum(engine)` returns a validation plan for the
+same-version CRC. It reconstructs actual state from discovered commits and checkpoints, including
+V2 manifest actions and sidecars. Kernel consumes only bounded Protocol/Metadata state to resolve
+retention and feature policy; action-sized reconciliation and comparison execute in the engine.
+Results report per-field `checked`, `absent`, `partial`, or `unavailable` coverage. Checkpoint-based
+`allFiles` comparison excludes raw stats and reports partial coverage. Adaptive metadata and
+ambiguous same-version logical-file actions are unsupported.
+
 ## Read Path
 
 `Snapshot` -> `ScanBuilder` -> `Scan` -> data
@@ -67,6 +75,10 @@ set), `data_skipping.rs` (rewrite predicates against min/max/nullCount stats and
   calls `transform_to_logical` / `DvInfo::get_selection_vector`
 - `scan.parallel_scan_metadata(engine)`: two-phase distributed log replay (requires the
   `internal-api` feature)
+- `scan.declarative_metadata_scan_plan(engine)`: engine-owned live-Add replay under
+  `declarative-plans`. `ScanBuilder::with_checksum_validation()` enables same-version CRC file
+  totals on predicate-free scans. Checks preserve rows and complete only after input exhaustion;
+  missing CRCs do not prevent scans. Optimizers must retain validation and its error semantics.
 
 **Incremental read:** `Snapshot::incremental_scan_builder(base_version)` streams the file-action
 diff over `(base_version, target_version]`: live Adds as a `FilteredEngineData` iterator

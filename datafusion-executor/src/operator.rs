@@ -31,9 +31,11 @@ use delta_kernel::plans::ir::nodes::{
 use delta_kernel::schema::{StructField, StructType};
 
 use crate::expression::to_df_struct_columns;
+use crate::json_object::lower_json_object;
 use crate::predicate::to_df_predicate_expr;
 use crate::scalar::to_df_scalar;
 use crate::utils::column_to_df_expr;
+use crate::validation::{lower_validation, ValidationKind};
 
 /// Lowers one kernel [`Operator`](KernelOperator) over its already-lowered inputs.
 ///
@@ -51,6 +53,12 @@ pub(crate) fn lower_operator(
         ))
     };
     match op {
+        KernelOperator::ReadJsonObject(source) => {
+            if !inputs.is_empty() {
+                return Err(input_count_error(0));
+            }
+            lower_json_object(source)
+        }
         KernelOperator::Values(values) => {
             let [] = inputs else {
                 return Err(input_count_error(0));
@@ -82,6 +90,15 @@ pub(crate) fn lower_operator(
             lower_semi_join(semi_join, probe, build)
         }
         KernelOperator::UnionAll(union_all) => lower_union_all(union_all, inputs),
+        KernelOperator::ValidateAggregates(validation) => {
+            lower_validation(ValidationKind::Aggregates(validation.clone()), inputs)
+        }
+        KernelOperator::ValidateRelation(validation) => {
+            lower_validation(ValidationKind::Relation(validation.clone()), inputs)
+        }
+        KernelOperator::ValidateHistogram(validation) => {
+            lower_validation(ValidationKind::Histogram(validation.clone()), inputs)
+        }
         // TODO: lower the remaining operators (scans and Load), each in its own change.
         _ => Err(DataFusionError::NotImplemented(format!(
             "lowering operator {op} to a DataFusion LogicalPlan"

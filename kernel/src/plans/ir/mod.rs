@@ -8,5 +8,6 @@
 pub mod nodes;
 pub mod operation;
 pub mod plan;
+pub mod validation;
 
 pub use operation::{IoOperation, Operation};

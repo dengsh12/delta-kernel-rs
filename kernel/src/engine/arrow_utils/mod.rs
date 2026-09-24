@@ -1483,7 +1483,7 @@ pub(crate) fn filter_to_record_batch(
 /// MapArrays. For MapArrays, it uses Arrow's map encoder with options preserving
 /// keys that have null values.
 #[derive(Debug)]
-struct NullValueMapEncoderFactory;
+pub(crate) struct NullValueMapEncoderFactory;
 
 impl EncoderFactory for NullValueMapEncoderFactory {
     fn make_default_encoder<'a>(
