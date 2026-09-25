@@ -7,12 +7,15 @@ use delta_kernel::arrow::datatypes::{
     DataType as ArrowDataType, Field, Int32Type, Int64Type, Schema as ArrowSchema,
 };
 use delta_kernel::arrow::record_batch::RecordBatch;
+use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::to_json_bytes;
+use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt};
-use delta_kernel::schema::{schema_ref, MetadataColumnSpec, SchemaRef, StructField};
+use delta_kernel::schema::{schema_ref, DataType, MetadataColumnSpec, SchemaRef, StructField};
+use delta_kernel::transaction::create_table::create_table as create_table_builder;
 use delta_kernel::transaction::CommitResult;
 use delta_kernel::{DeltaResult, Error, Snapshot};
 use itertools::Itertools;
@@ -36,6 +39,102 @@ use crate::common::write_utils::{
     create_dv_update_transaction, get_scan_files, set_table_properties,
     write_deletion_vector_to_store,
 };
+
+#[rstest]
+#[case::both_present(true, &[], None)]
+#[case::missing_row_id(
+    true,
+    &["delta.rowTracking.materializedRowIdColumnName"],
+    Some("metadata is missing 'delta.rowTracking.materializedRowIdColumnName'")
+)]
+#[case::missing_row_commit_version(
+    true,
+    &["delta.rowTracking.materializedRowCommitVersionColumnName"],
+    Some("metadata is missing 'delta.rowTracking.materializedRowCommitVersionColumnName'")
+)]
+#[case::both_missing(
+    true,
+    &[
+        "delta.rowTracking.materializedRowIdColumnName",
+        "delta.rowTracking.materializedRowCommitVersionColumnName",
+    ],
+    Some("metadata is missing 'delta.rowTracking.materializedRowIdColumnName'")
+)]
+#[case::supported_only_missing_row_id(
+    false,
+    &["delta.rowTracking.materializedRowIdColumnName"],
+    None
+)]
+#[case::supported_only_missing_row_commit_version(
+    false,
+    &["delta.rowTracking.materializedRowCommitVersionColumnName"],
+    None
+)]
+#[case::supported_only_both_missing(
+    false,
+    &[
+        "delta.rowTracking.materializedRowIdColumnName",
+        "delta.rowTracking.materializedRowCommitVersionColumnName",
+    ],
+    None
+)]
+#[tokio::test]
+async fn transaction_requires_materialized_row_tracking_column_names(
+    #[case] row_tracking_enabled: bool,
+    #[case] missing_properties: &[&str],
+    #[case] expected_error: Option<&str>,
+    #[values("none", "name", "id")] cm_mode: &str,
+    #[values(false, true)] alter_table: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let schema = schema_ref! { nullable "id": INTEGER };
+    let snapshot = create_table_builder(&table_path, schema, "test")
+        .with_table_properties([
+            ("delta.enableRowTracking", "true"),
+            ("delta.columnMapping.mode", cm_mode),
+        ])
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?
+        .unwrap_post_commit_snapshot();
+    let table_url = snapshot.table_root();
+    let mut metadata = read_actions_from_commit(table_url, 0, "metaData")?
+        .pop()
+        .expect("CREATE TABLE should write metadata");
+    let configuration = metadata["configuration"]
+        .as_object_mut()
+        .expect("metadata configuration should be an object");
+    for key in missing_properties {
+        assert!(configuration.remove(*key).is_some());
+    }
+    if !row_tracking_enabled {
+        configuration.remove("delta.enableRowTracking");
+    }
+    // CREATE TABLE assigns both names, so write malformed metadata directly to test existing
+    // tables.
+    add_commit(
+        table_url.as_str(),
+        &LocalFileSystem::new(),
+        1,
+        serde_json::json!({"metaData": metadata}).to_string(),
+    )
+    .await?;
+    let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+    let result = if alter_table {
+        snapshot
+            .alter_table()
+            .add_column(StructField::nullable("new_column", DataType::INTEGER))
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
+            .map(|_| ())
+    } else {
+        begin_transaction(snapshot, engine.as_ref()).map(|_| ())
+    };
+    if let Some(expected_error) = expected_error {
+        assert_result_error_with_message(result, expected_error);
+    } else {
+        result?;
+    }
+    Ok(())
+}
 
 /// Helper function to create a simple table with row tracking enabled.
 async fn create_row_tracking_table(

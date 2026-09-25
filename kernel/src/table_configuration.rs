@@ -37,7 +37,9 @@ use crate::table_features::{
     TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION, V2_VALIDATOR,
     V3_VALIDATOR,
 };
-use crate::table_properties::TableProperties;
+use crate::table_properties::{
+    TableProperties, MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME, MATERIALIZED_ROW_ID_COLUMN_NAME,
+};
 use crate::transforms::SchemaTransform as _;
 use crate::utils::require;
 use crate::{DeltaResult, Error, Version};
@@ -726,7 +728,7 @@ impl TableConfiguration {
     /// the protocol's features are all supported for the requested operation type.
     ///
     /// - For `SnapshotLoad`, `Scan` and `Cdf`: checks reader version and reader features
-    /// - For `Write` operations: checks writer version and writer features
+    /// - For `Write` operations: checks writer version, writer features, and required metadata
     #[internal_api]
     pub(crate) fn ensure_operation_supported(&self, operation: Operation) -> DeltaResult<()> {
         match operation {
@@ -777,6 +779,22 @@ impl TableConfiguration {
         // Check all enabled writer features have kernel support
         for feature in self.get_enabled_writer_features() {
             self.check_feature_support(&feature, Operation::Write)?;
+        }
+
+        // Required even when a write does not materialize row tracking columns.
+        // https://github.com/delta-io/delta/blob/master/PROTOCOL.md#writer-requirements-for-row-tracking
+        if self.table_properties.enable_row_tracking == Some(true) {
+            for key in [
+                MATERIALIZED_ROW_ID_COLUMN_NAME,
+                MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME,
+            ] {
+                require!(
+                    self.metadata.configuration().contains_key(key),
+                    Error::missing_data(format!(
+                        "Row tracking is enabled but metadata is missing '{key}'"
+                    ))
+                );
+            }
         }
 
         // Schema-dependent validation for Invariants (can't be in FeatureInfo)
@@ -969,7 +987,8 @@ mod test {
     use crate::table_properties::{
         TableProperties, ENABLE_DELETION_VECTORS, ENABLE_ICEBERG_COMPAT_V1,
         ENABLE_ICEBERG_COMPAT_V2, ENABLE_ICEBERG_COMPAT_V3, ENABLE_IN_COMMIT_TIMESTAMPS,
-        ENABLE_ROW_TRACKING,
+        ENABLE_ROW_TRACKING, MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME,
+        MATERIALIZED_ROW_ID_COLUMN_NAME,
     };
     use crate::unit_test_utils::{
         assert_result_error_with_message, test_schema_flat, test_schema_flat_with_column_mapping,
@@ -2550,6 +2569,11 @@ mod test {
             .with_properties([
                 (ENABLE_ICEBERG_COMPAT_V3, "true"),
                 (ENABLE_ROW_TRACKING, "true"),
+                (MATERIALIZED_ROW_ID_COLUMN_NAME, "_row_id"),
+                (
+                    MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME,
+                    "_row_commit_version",
+                ),
             ])
             .with_column_mapping(ColumnMappingMode::Name)
             .with_protocol(
