@@ -84,6 +84,8 @@ struct InternalScanState {
     partition_values_options: ScanPartitionValuesOptions,
     /// Physical partition schema for checkpoint partition pruning via `partitionValues_parsed`
     physical_partition_schema: Option<SchemaRef>,
+    #[serde(default)]
+    physical_timestamp_partition_columns: Vec<String>,
     /// Physical leaf paths eligible for data skipping. Carried alongside
     /// `physical_stats_schemas.read` so the distributed `DataSkippingFilter` rebuilds the same
     /// filter the sequential phase used. `#[serde(default)]` keeps older blobs readable: an empty
@@ -401,6 +403,7 @@ impl ScanLogReplayProcessor {
             column_mapping_mode,
             physical_stats_schemas,
             physical_partition_schema,
+            physical_timestamp_partition_columns,
             eligible_physical_stats_columns,
             requested_physical_stats_columns,
             is_catalog_managed,
@@ -425,6 +428,7 @@ impl ScanLogReplayProcessor {
             stats_options: self.stats_options,
             partition_values_options: self.partition_values_options,
             physical_partition_schema,
+            physical_timestamp_partition_columns,
             eligible_physical_stats_columns,
             requested_physical_stats_columns,
             is_catalog_managed,
@@ -490,6 +494,8 @@ impl ScanLogReplayProcessor {
             column_mapping_mode: internal_state.column_mapping_mode,
             physical_stats_schemas: internal_state.physical_stats_schemas,
             physical_partition_schema: internal_state.physical_partition_schema,
+            physical_timestamp_partition_columns: internal_state
+                .physical_timestamp_partition_columns,
             eligible_physical_stats_columns: internal_state.eligible_physical_stats_columns,
             requested_physical_stats_columns: internal_state.requested_physical_stats_columns,
             is_catalog_managed: internal_state.is_catalog_managed,
@@ -655,13 +661,30 @@ impl<'a, D: Deduplicator> AddRemoveDedupVisitor<'a, D> {
         // (checkpoint batch), so do not try to extract remove actions in that case.
         let is_log_batch = self.deduplicator.is_log_batch();
         if !selected {
-            // Data-skipping predicates keep non-Add rows, so an unselected row is an Add. We
-            // don't put it into dedup in favor of performance and memory.
-
             // TODO(#2945): A stats update can cause the newest Add to be pruned before
             // deduplication, allowing an older Add for the same file to survive. We should
             // fix the problem.
             self.metrics.record_add_file_seen(is_log_batch);
+            let timestamp_columns = &self.state_info.physical_timestamp_partition_columns;
+            if is_log_batch && !timestamp_columns.is_empty() {
+                let partition_values = getters[ScanLogReplayProcessor::ADD_PARTITION_VALUES_INDEX]
+                    .get_map(row, "add.partitionValues")?;
+                let needs_dedup = partition_values.is_some_and(|values| {
+                    timestamp_columns
+                        .iter()
+                        .any(|name| values.get(name).is_some_and(is_offsetless_timestamp))
+                });
+                // A checkpoint may interpret the same local timestamp differently. Remember the
+                // newer Add even when its predicate fails, so the checkpoint cannot revive it.
+                if needs_dedup {
+                    if let Some(action) =
+                        self.deduplicator
+                            .extract_file_action(row, getters, !is_log_batch)?
+                    {
+                        self.deduplicator.check_and_record_seen(action.key);
+                    }
+                }
+            }
             return Ok(false);
         }
         let Some(FileActionInfo {
@@ -800,6 +823,20 @@ impl<D: Deduplicator> RowVisitor for AddRemoveDedupVisitor<'_, D> {
 
         Ok(())
     }
+}
+
+// Classify the raw spelling without parsing or validating it. Only the engine interprets the
+// timestamp; date-only and compact-clock spellings can also depend on the reader timezone.
+fn is_offsetless_timestamp(raw: &str) -> bool {
+    let raw = raw.trim();
+    if raw.is_empty() || raw.ends_with(['Z', 'z']) {
+        return false;
+    }
+    let time = raw
+        .split_once(['T', 't', ' '])
+        .map_or("", |(_, time)| time.trim());
+    time.bytes()
+        .all(|byte| byte.is_ascii_digit() || byte == b':' || byte == b'.')
 }
 
 pub(crate) static FILE_CONSTANT_VALUES_NAME: &str = "fileConstantValues";
@@ -1342,6 +1379,25 @@ mod tests {
         CheckpointReadInfo::without_stats_parsed()
     }
 
+    #[rstest]
+    #[case("2024-01-15 12:30:45", true)]
+    #[case("2024-01-15T12:30:45.123456789123", true)]
+    #[case("2024-01-15t12:30:45", true)]
+    #[case("2024-01-15 123045", true)]
+    #[case("2024-01-15", true)]
+    #[case("2024-01-15T12:30:45Z", false)]
+    #[case("2024-01-15T12:30:45z", false)]
+    #[case("2024-01-15T12:30:45+05:30", false)]
+    #[case("2024-01-15 12:30:45-0530", false)]
+    #[case("2024-01-15 12:30:45 +05:30", false)]
+    #[case("2024-01-15 12:30:45 America/Los_Angeles", false)]
+    #[case("2024-01-15 12:30:45 Etc/GMT-8", false)]
+    #[case("2024-01-15 12:30:45 GMT0", false)]
+    #[case("", false)]
+    fn timestamp_partition_dedup_classifies_raw_values(#[case] raw: &str, #[case] expected: bool) {
+        assert_eq!(super::is_offsetless_timestamp(raw), expected);
+    }
+
     /// A minimal opaque predicate op for testing serialization behavior
     #[derive(Debug, PartialEq)]
     struct OpaqueTestOp(String);
@@ -1470,6 +1526,7 @@ mod tests {
             column_mapping_mode: ColumnMappingMode::None,
             physical_stats_schemas: None,
             physical_partition_schema: None,
+            physical_timestamp_partition_columns: Vec::new(),
             eligible_physical_stats_columns: HashSet::new(),
             requested_physical_stats_columns: Vec::new(),
             is_catalog_managed: false,
@@ -1840,11 +1897,12 @@ mod tests {
         let schema: SchemaRef = schema_ref! {
             nullable "value": INTEGER,
             nullable "date": DATE,
+            nullable "ts": TIMESTAMP,
         };
         let state_info = Arc::new(
             get_state_info(
                 schema,
-                vec!["date".to_string()],
+                vec!["date".to_string(), "ts".to_string()],
                 None,
                 ROW_TRACKING_FEATURES,
                 [
@@ -1882,6 +1940,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(deserialized.state_info.transform_spec, original_transform);
+        assert_eq!(
+            deserialized.state_info.physical_timestamp_partition_columns,
+            vec!["ts"]
+        );
     }
 
     #[test]
@@ -1902,6 +1964,7 @@ mod tests {
                 column_mapping_mode: mode,
                 physical_stats_schemas: None,
                 physical_partition_schema: None,
+                physical_timestamp_partition_columns: Vec::new(),
                 eligible_physical_stats_columns: HashSet::new(),
                 requested_physical_stats_columns: Vec::new(),
                 is_catalog_managed: false,
@@ -1940,6 +2003,7 @@ mod tests {
             column_mapping_mode: ColumnMappingMode::None,
             physical_stats_schemas: None,
             physical_partition_schema: None,
+            physical_timestamp_partition_columns: Vec::new(),
             eligible_physical_stats_columns: HashSet::new(),
             requested_physical_stats_columns: Vec::new(),
             is_catalog_managed: false,
@@ -1974,6 +2038,7 @@ mod tests {
             column_mapping_mode: ColumnMappingMode::None,
             physical_stats_schemas: None,
             physical_partition_schema: None,
+            physical_timestamp_partition_columns: Vec::new(),
             eligible_physical_stats_columns: HashSet::new(),
             requested_physical_stats_columns: Vec::new(),
             is_catalog_managed: true,
@@ -2008,6 +2073,7 @@ mod tests {
             column_mapping_mode: ColumnMappingMode::None,
             physical_stats_schemas: None,
             physical_partition_schema: None,
+            physical_timestamp_partition_columns: Vec::new(),
             eligible_physical_stats_columns: HashSet::new(),
             requested_physical_stats_columns: Vec::new(),
             is_catalog_managed: false,
@@ -2043,6 +2109,7 @@ mod tests {
             column_mapping_mode: ColumnMappingMode::None,
             physical_stats_schemas: None,
             physical_partition_schema: None,
+            physical_timestamp_partition_columns: Vec::new(),
             eligible_physical_stats_columns: HashSet::new(),
             requested_physical_stats_columns: Vec::new(),
             is_catalog_managed: false,
@@ -2123,6 +2190,7 @@ mod tests {
             stats_options: ScanStatsOptions::default(),
             partition_values_options: ScanPartitionValuesOptions::default(),
             physical_partition_schema: None,
+            physical_timestamp_partition_columns: Vec::new(),
             eligible_physical_stats_columns: HashSet::new(),
             requested_physical_stats_columns: Vec::new(),
             is_catalog_managed: false,
@@ -2157,6 +2225,7 @@ mod tests {
             stats_options: ScanStatsOptions::default(),
             partition_values_options: ScanPartitionValuesOptions::default(),
             physical_partition_schema: None,
+            physical_timestamp_partition_columns: Vec::new(),
             eligible_physical_stats_columns: HashSet::new(),
             requested_physical_stats_columns: Vec::new(),
             is_catalog_managed: false,

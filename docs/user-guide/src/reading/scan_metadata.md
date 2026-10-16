@@ -285,6 +285,13 @@ adds the typed column.
 > When the checkpoint already stores typed partition values, Kernel reads that column directly
 > and skips parsing entirely.
 
+When a timestamp partition value has no offset, `scan_metadata()` and
+`parallel_scan_metadata()` remember the file's newest Add even if a predicate prunes it.
+This prevents an older checkpoint Add from resurfacing when its stored timestamp differs
+from the parsed string. You can disable this check with
+`ScanBuilder::with_timestamp_partition_dedup(false)` to avoid inspecting pruned Adds'
+partition values, accepting that older checkpoint Adds may be returned in this case.
+
 ## Cancelling a scan
 
 Log replay for a large table can read many commit and checkpoint files before it yields a single

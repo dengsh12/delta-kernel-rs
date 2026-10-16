@@ -166,6 +166,7 @@ pub(crate) fn run_with_validate_callback<T: Clone>(
         column_mapping_mode: ColumnMappingMode::None,
         physical_stats_schemas: None,
         physical_partition_schema: None,
+        physical_timestamp_partition_columns: Vec::new(),
         eligible_physical_stats_columns: HashSet::new(),
         requested_physical_stats_columns: Vec::new(),
         is_catalog_managed: false,

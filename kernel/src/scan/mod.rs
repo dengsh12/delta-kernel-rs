@@ -336,6 +336,7 @@ pub struct ScanBuilder {
     stats: StatsOptions,
     correlation_id: Option<Arc<str>>,
     without_row_transforms: bool,
+    timestamp_partition_dedup: bool,
     partition_values: PartitionValuesOptions,
     cancellation_token: Option<CancellationTokenRef>,
 }
@@ -348,6 +349,7 @@ impl std::fmt::Debug for ScanBuilder {
             .field("stats", &self.stats)
             .field("correlation_id", &self.correlation_id)
             .field("without_row_transforms", &self.without_row_transforms)
+            .field("timestamp_partition_dedup", &self.timestamp_partition_dedup)
             .field("partition_values", &self.partition_values)
             .finish()
     }
@@ -363,6 +365,7 @@ impl ScanBuilder {
             stats: StatsOptions::default(),
             correlation_id: None,
             without_row_transforms: false,
+            timestamp_partition_dedup: true,
             partition_values: PartitionValuesOptions::default(),
             cancellation_token: None,
         }
@@ -416,6 +419,16 @@ impl ScanBuilder {
     /// checkpoints omit JSON stats and skip `ToJson` synthesis.
     pub fn with_stats(mut self, stats: StatsOptions) -> Self {
         self.stats = stats;
+        self
+    }
+
+    /// Controls whether pruned Adds with offset-less `TIMESTAMP` partition values suppress older
+    /// actions for the same file. Enabled by default for scan metadata replay.
+    ///
+    /// Disabling this avoids inspecting pruned Adds' partition values, but can return an older
+    /// checkpoint Add when its stored timestamp and the JSON Add's parsed timestamp disagree.
+    pub fn with_timestamp_partition_dedup(mut self, enabled: bool) -> Self {
+        self.timestamp_partition_dedup = enabled;
         self
     }
 
@@ -537,6 +550,9 @@ impl ScanBuilder {
         // Retain the transform spec but skip building per-file expressions, which also skips the
         // per-row partition-value parse done only to build them.
         state_info.skip_row_transforms = self.without_row_transforms;
+        if !self.timestamp_partition_dedup {
+            state_info.physical_timestamp_partition_columns.clear();
+        }
 
         let commits_since_checkpoint = self.snapshot.log_segment().commits_since_checkpoint();
         if self.snapshot.skipped_new_checkpoints() && commits_since_checkpoint > 0 {

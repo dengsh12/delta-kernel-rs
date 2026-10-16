@@ -19,4 +19,5 @@ mod metrics;
 mod parsed_partition_values;
 mod parsed_stats;
 mod read;
+mod timestamp_partition_dedup;
 mod write;

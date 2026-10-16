@@ -118,6 +118,9 @@ pub(crate) struct StateInfo {
     /// predicate-referenced columns, for partition pruning) or the engine requested the typed
     /// struct in scan output (all partition columns).
     pub(crate) physical_partition_schema: Option<SchemaRef>,
+    /// All physical TIMESTAMP partition names, including columns outside the scan projection and
+    /// predicate. Empty when timestamp partition deduplication is disabled.
+    pub(crate) physical_timestamp_partition_columns: Vec<String>,
     /// Physical leaf paths eligible for data skipping.
     ///
     /// This combines the table's indexed columns with caller-requested columns and gates which
@@ -393,6 +396,15 @@ impl StateInfo {
         stats.validate()?;
         let partition_columns = table_configuration.logical_partition_columns();
         let column_mapping_mode = table_configuration.column_mapping_mode();
+        let physical_timestamp_partition_columns = table_configuration
+            .logical_schema()
+            .fields()
+            .filter(|field| {
+                partition_columns.contains(field.name())
+                    && field.data_type() == &DataType::TIMESTAMP
+            })
+            .map(|field| field.physical_name(column_mapping_mode).to_string())
+            .collect();
         let mut read_fields = Vec::with_capacity(logical_read_schema.num_fields());
         let mut transform_spec = Vec::with_capacity(logical_read_schema.num_fields());
         let mut last_physical_field: Option<String> = None;
@@ -633,6 +645,7 @@ impl StateInfo {
             column_mapping_mode,
             physical_stats_schemas,
             physical_partition_schema,
+            physical_timestamp_partition_columns,
             eligible_physical_stats_columns,
             requested_physical_stats_columns,
             is_catalog_managed: table_configuration.is_catalog_managed(),
